@@ -5,13 +5,21 @@ name: Release Android
 # 额外的 NDK/Gradle 工具链，不应让它的失败阻塞桌面三平台的发布。
 #
 # 触发：
-#   - tag v*              → 构建 AAB + APK，产物挂到该 tag 的 GitHub Release
-#   - workflow_dispatch   → 手动构建；可指定 version / version_code，
-#                           并决定是否发布到 GitHub、上传到哪个 Play track
+#   - tag v*              → 构建 AAB + APK，产物挂到该 tag 的 GitHub Release（严格冒烟）
+#   - workflow_dispatch   → 手动构建，默认只出 artifact + 宽松冒烟；发布/上架都是可选：
+#       version / version_code  版本号与 versionCode（都可留空自动推导）
+#       publish_github          勾选才把产物挂到 GitHub Release（建出的 release 是草稿）
+#       play_track              填了才上传 Play（internal/beta/prod/production）
+#       smoke_strict            勾选后连"libwails.so 体积"这类启发式断言也判失败
+#     tag 发布路径无视上述可选项，始终发布 + 始终严格。
 #
 # 交付物：
 #   goink-v<ver>-android-universal.apk  双 ABI，直接安装/自测用
 #   goink-v<ver>-android.aab            Play Store 上架用（Google 要求 AAB）
+#   sha256sums.txt                      两个产物的校验和
+#
+# Android 脚手架（build/android：Gradle 工程 + android Taskfile）已入库；缺失时
+# .github/actions/android-setup 会退回用 scripts/bootstrap-android-assets.sh 现场生成。
 #
 # 需要的 secrets（不配则退化为 debug 签名，可安装但 Play 会拒收）：
 #   ANDROID_KEYSTORE_BASE64     release keystore (.jks) 的 base64
@@ -35,14 +43,19 @@ on:
         required: false
         default: ''
       publish_github:
-        description: '是否把产物挂到 GitHub Release'
+        description: '是否把产物挂到 GitHub Release（调试阶段默认 false：手动跑时 ref 是分支，发布会牵出建 tag 等副作用；tag v* 触发时始终发布）'
         type: boolean
         required: false
-        default: true
+        default: false
       play_track:
         description: 'Play 轨道（留空则不上传；首次建议 internal）'
         required: false
         default: ''
+      smoke_strict:
+        description: '严格冒烟检查：连 libwails.so 体积这类启发式断言也判失败。调试阶段建议留空（false），tag 发布时无论此项都会严格'
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -171,6 +184,11 @@ jobs:
           VERSION_CORE: ${{ steps.goink_env.outputs.version-core }}
           VERSION_CODE: ${{ steps.android_env.outputs.version-code }}
           EXPECTED_APP_ID: ${{ env.APP_ID }}
+          # tag 发布一定是严格；workflow_dispatch 由 smoke_strict 决定。
+          # 调试阶段可以关掉第 5 项那条体积启发式（它只是"前端 dist 有没有打进
+          # libwails.so"的代理指标，阈值是拍的，Android 上后端裁得薄一点就会误报），
+          # 但包名 / versionCode / versionName / native 库存在性这几条永远硬失败。
+          SMOKE_STRICT: ${{ github.event_name != 'workflow_dispatch' || inputs.smoke_strict }}
         run: |
           set -euo pipefail
           AAB=bin/goink.aab
@@ -197,9 +215,18 @@ jobs:
           #   兜底 —— 直接读 APK 里 AndroidManifest 的字符串池（unzip+tr，不依赖 SDK
           #   分析工具），能断言包名和 versionName；versionCode 是 AXML 头里的整型字段，
           #   字符串池里没有，只能降级成 warning。
-          AAPT2="$(ls "${ANDROID_HOME}"/build-tools/*/aapt2 2>/dev/null | sort -V | tail -1 || true)"
-          AAPT="$(ls "${ANDROID_HOME}"/build-tools/*/aapt 2>/dev/null | sort -V | tail -1 || true)"
-          APKSIGNER="$(ls "${ANDROID_HOME}"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -1 || true)"
+          # 优先用 job env 里 pin 的 build-tools（ubuntu 镜像还预装了更新的版本，
+          # 这次实测落到 build-tools/37.0.0/aapt2 上去了）。aapt2 的 badging 输出
+          # 格式多年不变，版本漂移不影响结论，但日志里写明的版本应该就是我们 pin 的那个，
+          # 出问题时要能对上 ANDROID_BUILD_TOOLS 那句话"升级只改一处"。
+          pick_build_tool() {
+            local pinned="${ANDROID_HOME}/build-tools/${ANDROID_BUILD_TOOLS}/$1"
+            if [ -x "${pinned}" ]; then printf '%s\n' "${pinned}"; return; fi
+            ls -d "${ANDROID_HOME}"/build-tools/*/"$1" 2>/dev/null | sort -V | tail -1
+          }
+          AAPT2="$(pick_build_tool aapt2 || true)"
+          AAPT="$(pick_build_tool aapt || true)"
+          APKSIGNER="$(pick_build_tool apksigner || true)"
 
           BADGE=""
           for TOOL in "${AAPT2}" "${AAPT}"; do
@@ -263,8 +290,11 @@ jobs:
             if [ -z "$SIZE" ]; then
               echo "::warning::AAB 中未取到 lib/${ABI}/libwails.so 的原始大小"
             elif [ "$SIZE" -lt "$MIN_BYTES" ]; then
-              echo "::error::lib/${ABI}/libwails.so 仅 $SIZE 字节（<10MB），疑似前端 dist 未嵌入"
-              exit 1
+              if [ "${SMOKE_STRICT}" = "true" ]; then
+                echo "::error::lib/${ABI}/libwails.so 仅 $SIZE 字节（<10MB），疑似前端 dist 未嵌入"
+                exit 1
+              fi
+              echo "::warning::lib/${ABI}/libwails.so 仅 $SIZE 字节（<10MB 阈值）；调试模式放行，正式 tag 发布会判失败"
             else
               echo "lib/${ABI}/libwails.so 原始大小 $SIZE 字节 OK"
             fi
@@ -294,16 +324,22 @@ jobs:
           path: build/dist/*
           if-no-files-found: error
 
+      # 发布是可选项：只有 tag v* 触发才默认发布；workflow_dispatch 必须显式勾选
+      # publish_github（调试阶段产物不确定，先别动 release）。
       - name: Attach to GitHub Release
         if: github.event_name == 'push' || inputs.publish_github
         uses: softprops/action-gh-release@v2
         with:
           files: build/dist/*
-          # 必须显式给 tag：action 的默认值是 github.ref，workflow_dispatch 时那是
-          # refs/heads/<branch>，会被当 tag_name 用（要么报错，要么建出一个挂在分支名
-          # 上的怪 release）。tag 触发时 ref_name 本来就是 v1.6.0，dispatch 时用解析出来
-          # 的版本补 v 前缀。
-          tag: ${{ github.event_name == 'push' && github.ref_name || format('v{0}', steps.goink_env.outputs.version) }}
+          # 输入名是 tag_name 不是 tag —— v2 收到未知输入只会打个
+          # "Unexpected input(s) 'tag'" 警告然后按没传处理，dispatch 时
+          # github.ref 是分支，于是直接 "⚠️ GitHub Releases requires a tag" 失败。
+          tag_name: ${{ github.event_name == 'push' && github.ref_name || format('v{0}', steps.goink_env.outputs.version) }}
+          # dispatch 时 tag 可能还不存在，action 需要 target_commitish 才知道把
+          # tag 打到哪个 commit；tag 触发时这个值不会被用到。
+          target_commitish: ${{ github.sha }}
+          # 手动构建发布的先挂成草稿，确认无误再人工置为正式，避免半成品对外可见。
+          draft: ${{ github.event_name != 'push' }}
           # tag 触发时桌面 release.yml 也在建同一个 release；这里只做追加，
           # 已存在就复用，避免互相覆盖。
           append_body: false
