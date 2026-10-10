@@ -1,0 +1,143 @@
+name: Verify macOS CLT Git
+
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: macos-latest
+    steps:
+      - name: Find real git binary
+        run: |
+          echo "=== /usr/bin/git info ==="
+          file /usr/bin/git
+          ls -la /usr/bin/git
+          echo ""
+
+          echo "=== Xcode CLT git ==="
+          if [ -f "/Library/Developer/CommandLineTools/usr/bin/git" ]; then
+            echo "Found CLT git"
+            ls -la /Library/Developer/CommandLineTools/usr/bin/git
+          else
+            echo "CLT git NOT found"
+          fi
+          echo ""
+
+          echo "=== Xcode app git ==="
+          if [ -f "/Applications/Xcode.app/Contents/Developer/usr/bin/git" ]; then
+            echo "Found Xcode app git"
+            ls -la /Applications/Xcode.app/Contents/Developer/usr/bin/git
+          else
+            echo "Xcode app git NOT found"
+          fi
+          echo ""
+
+          echo "=== which git ==="
+          which git
+          echo ""
+
+          echo "=== git --version ==="
+          git --version
+
+      - name: otool -L on CLT git
+        run: |
+          CLT_GIT="/Library/Developer/CommandLineTools/usr/bin/git"
+          XCODE_GIT="/Applications/Xcode.app/Contents/Developer/usr/bin/git"
+
+          echo "=== otool -L /usr/bin/git ==="
+          otool -L /usr/bin/git
+          echo ""
+
+          if [ -f "$CLT_GIT" ]; then
+            echo "=== otool -L $CLT_GIT ==="
+            otool -L "$CLT_GIT"
+            echo ""
+          fi
+
+          if [ -f "$XCODE_GIT" ]; then
+            echo "=== otool -L $XCODE_GIT ==="
+            otool -L "$XCODE_GIT"
+            echo ""
+          fi
+
+      - name: Copy and test CLT git
+        run: |
+          CLT_GIT="/Library/Developer/CommandLineTools/usr/bin/git"
+          XCODE_GIT="/Applications/Xcode.app/Contents/Developer/usr/bin/git"
+          TEST_DIR="/tmp/git-test"
+          mkdir -p "$TEST_DIR"
+
+          # Try CLT git first, then Xcode app git
+          SOURCE=""
+          if [ -f "$CLT_GIT" ]; then
+            SOURCE="$CLT_GIT"
+          elif [ -f "$XCODE_GIT" ]; then
+            SOURCE="$XCODE_GIT"
+          fi
+
+          if [ -z "$SOURCE" ]; then
+            echo "ERROR: No real git binary found!"
+            exit 1
+          fi
+
+          echo "=== Copying $SOURCE to $TEST_DIR/git ==="
+          cp "$SOURCE" "$TEST_DIR/git"
+          chmod +x "$TEST_DIR/git"
+          echo ""
+
+          echo "=== otool -L of copied git ==="
+          otool -L "$TEST_DIR/git"
+          echo ""
+
+          echo "=== Testing copied git ==="
+          "$TEST_DIR/git" --version
+          echo ""
+
+          echo "=== Testing copied git init ==="
+          mkdir /tmp/test-repo
+          cd /tmp/test-repo
+          "$TEST_DIR/git" init
+          "$TEST_DIR/git" config user.name "Test"
+          "$TEST_DIR/git" config user.email "test@test.com"
+          echo "hello" > test.txt
+          "$TEST_DIR/git" add test.txt
+          "$TEST_DIR/git" commit -m "test commit"
+          "$TEST_DIR/git" log --oneline
+          echo ""
+          echo "=== ALL TESTS PASSED ==="
+
+      - name: Also test /usr/bin/git stub behavior
+        run: |
+          echo "=== Can /usr/bin/git run from its original location? ==="
+          /usr/bin/git --version
+          echo ""
+
+          echo "=== Copy /usr/bin/git to another location ==="
+          cp /usr/bin/git /tmp/git-test/git-stub
+          chmod +x /tmp/git-test/git-stub
+          echo ""
+
+          echo "=== Can the copied stub run? ==="
+          /tmp/git-test/git-stub --version 2>&1 || echo "STUB FAILED (expected)"
+          echo ""
+
+          echo "=== Size comparison ==="
+          ls -la /usr/bin/git /tmp/git-test/git /tmp/git-test/git-stub
+
+      - name: Prepare artifact
+        run: |
+          mkdir -p /tmp/git-artifact
+          cp /tmp/git-test/git /tmp/git-artifact/git
+          # 保存 otool 输出和版本信息
+          otool -L /tmp/git-test/git > /tmp/git-artifact/otool-L.txt 2>&1
+          /tmp/git-test/git --version >> /tmp/git-artifact/version.txt 2>&1
+          file /tmp/git-test/git >> /tmp/git-artifact/version.txt 2>&1
+          ls -la /tmp/git-test/git >> /tmp/git-artifact/version.txt 2>&1
+
+      - name: Upload CLT git artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-clt-git
+          path: /tmp/git-artifact/

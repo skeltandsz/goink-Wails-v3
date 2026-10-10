@@ -1,0 +1,287 @@
+name: Release Android
+
+# Android 客户端构建与发布（Wails v3 的 android:* 任务链）。
+# 独立于桌面 release.yml：Android 支持在 v3 里标注为 experimental，且需要
+# 额外的 NDK/Gradle 工具链，不应让它的失败阻塞桌面三平台的发布。
+#
+# 触发：
+#   - tag v*              → 构建 AAB + APK，产物挂到该 tag 的 GitHub Release
+#   - workflow_dispatch   → 手动构建；可指定 version / version_code，
+#                           并决定是否发布到 GitHub、上传到哪个 Play track
+#
+# 交付物：
+#   goink-v<ver>-android-universal.apk  双 ABI，直接安装/自测用
+#   goink-v<ver>-android.aab            Play Store 上架用（Google 要求 AAB）
+#
+# 需要的 secrets（不配则退化为 debug 签名，可安装但 Play 会拒收）：
+#   ANDROID_KEYSTORE_BASE64     release keystore (.jks) 的 base64
+#   ANDROID_KEYSTORE_PASSWORD   库密码
+#   ANDROID_KEY_ALIAS           别名
+#   ANDROID_KEY_PASSWORD        密钥密码
+#   PLAY_SERVICE_ACCOUNT_JSON   Google Cloud 服务账号 JSON（Play 上传才需要）
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（不带 v 前缀，留空则由 tag / git describe 推导）'
+        required: false
+        default: ''
+      version_code:
+        description: '显式 versionCode（留空则按 x.y.z 推导；Play 要求每次上传递增）'
+        required: false
+        default: ''
+      publish_github:
+        description: '是否把产物挂到 GitHub Release'
+        type: boolean
+        required: false
+        default: true
+      play_track:
+        description: 'Play 轨道（留空则不上传；首次建议 internal）'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-android-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # 与 scripts/bootstrap-android-assets.sh、.github/actions/android-setup 保持一致；
+  # 升级 NDK/SDK 时改这里一处即可。
+  ANDROID_PLATFORM: 'android-35'
+  ANDROID_BUILD_TOOLS: '35.0.0'
+  ANDROID_NDK_VERSION: '26.3.11579264'
+  APP_ID: 'com.sigpanic.goink'
+  VERSION_LDFLAG: -X=github.com/sigpanic/goink/internal/version.Version
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      # 只借它装 Go/Node/wails3、推导版本号、同步 build/config.yml；
+      # Android 用 NDK clang 交叉编译，不需要 GTK/sqlite 头，也不需要
+      # build/runtime（MinGit 与 onnxruntime 在 Android 上没有对应形态）。
+      - name: Prepare Wails toolchain
+        id: goink_env
+        uses: ./.github/actions/wails3-setup
+        with:
+          version: ${{ inputs.version }}
+          gui-deps: 'false'
+          runtime-deps: 'false'
+
+      - name: Prepare Android toolchain
+        id: android_env
+        uses: ./.github/actions/android-setup
+        with:
+          version: ${{ steps.goink_env.outputs.version }}
+          version-core: ${{ steps.goink_env.outputs.version-core }}
+          version-code: ${{ inputs.version_code }}
+          platform: ${{ env.ANDROID_PLATFORM }}
+          build-tools: ${{ env.ANDROID_BUILD_TOOLS }}
+          ndk: ${{ env.ANDROID_NDK_VERSION }}
+
+      - name: Locate NDK for cross-compile
+        shell: bash
+        run: |
+          set -euo pipefail
+          # build/android/Taskfile.yml 里 compile:go:shared 的查找顺序是
+          # $ANDROID_NDK_HOME → $ANDROID_SDK_ROOT/ndk/* 取最新，两个都给上最稳。
+          NDK="$(ls -d "${ANDROID_HOME}/ndk/"* 2>/dev/null | sort -V | tail -1 || true)"
+          [ -n "$NDK" ] || { echo "::error::未在 ${ANDROID_HOME}/ndk 找到 NDK，setup-android 未装上 ndk;${ANDROID_NDK_VERSION}"; exit 1; }
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+          echo "NDK: $NDK"
+
+      - name: Restore signing keystore
+        id: keystore
+        shell: bash
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KS_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KS_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${KS_B64}" ]; then
+            echo "::warning::未配置 ANDROID_KEYSTORE_BASE64：release 产物会用 Android debug keystore 签名，能装到自家手机自测，但 Google Play 会拒收。"
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          KS_PATH="$RUNNER_TEMP/release.jks"
+          printf '%s' "$KS_B64" | base64 -d > "$KS_PATH"
+          [ -s "$KS_PATH" ] || { echo "::error::ANDROID_KEYSTORE_BASE64 解码后为空"; exit 1; }
+          # build.gradle 只读这四个环境变量（不读 Gradle properties），
+          # 变量名写错会静默退化成 debug 签名，所以这里集中设置并打印确认。
+          echo "ANDROID_KEYSTORE_FILE=$KS_PATH" >> "$GITHUB_ENV"
+          echo "ANDROID_KEYSTORE_PASSWORD=${KS_PASSWORD}" >> "$GITHUB_ENV"
+          echo "ANDROID_KEY_ALIAS=${KS_ALIAS}" >> "$GITHUB_ENV"
+          echo "ANDROID_KEY_PASSWORD=${KS_KEY_PASSWORD}" >> "$GITHUB_ENV"
+          echo "signed=true" >> "$GITHUB_OUTPUT"
+          echo "keystore: $KS_PATH ($(wc -c < "$KS_PATH") bytes)"
+
+      # 版本注入依赖 build/android/Taskfile.yml 的 EXTRA_LDFLAGS 钩子
+      # （由 bootstrap 脚本注入）。没有它，应用内版本会永远是 "dev"。
+      - name: Assert version injection hook exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -q 'EXTRA_LDFLAGS' build/android/Taskfile.yml; then
+            echo "EXTRA_LDFLAGS 钩子在位"
+          else
+            echo "::warning::build/android/Taskfile.yml 没有 EXTRA_LDFLAGS 钩子，internal/version.Version 不会被注入（应用内会显示 dev）。重跑 scripts/bootstrap-android-assets.sh 或手工补该钩子。"
+          fi
+
+      - name: Build AAB (Play artifact, both ABIs)
+        shell: bash
+        env:
+          VERSION: ${{ steps.goink_env.outputs.version }}
+        run: |
+          set -euo pipefail
+          # android:bundle:fat = build(PRODUCTION=true, arm64) + compile amd64
+          #   + gradlew bundleRelease -> bin/goink.aab
+          wails3 task android:bundle:fat \
+            APP_ID="${APP_ID}" \
+            EXTRA_LDFLAGS="${VERSION_LDFLAG}=${VERSION}"
+
+      - name: Build universal APK (direct install)
+        shell: bash
+        env:
+          VERSION: ${{ steps.goink_env.outputs.version }}
+        run: |
+          set -euo pipefail
+          # AAB 无法用 adb 直接安装，所以额外出一个 universal APK 给自测/dogfood。
+          wails3 task android:package:fat \
+            APP_ID="${APP_ID}" \
+            EXTRA_LDFLAGS="${VERSION_LDFLAG}=${VERSION}"
+
+      - name: Smoke test (Android)
+        shell: bash
+        env:
+          VERSION_CORE: ${{ steps.goink_env.outputs.version-core }}
+          VERSION_CODE: ${{ steps.android_env.outputs.version-code }}
+          EXPECTED_APP_ID: ${{ env.APP_ID }}
+        run: |
+          set -euo pipefail
+          AAB=bin/goink.aab
+          APK=bin/goink.apk
+
+          echo "=== 1. 产物存在 ==="
+          ls -la "$AAB" "$APK"
+          [ -s "$AAB" ] || { echo "::error::AAB 为空"; exit 1; }
+          [ -s "$APK" ] || { echo "::error::APK 为空"; exit 1; }
+
+          echo "=== 2. AAB 内含两个 ABI 的 libwails.so ==="
+          unzip -l "$AAB" > "$RUNNER_TEMP/aab.txt"
+          grep -E 'lib/arm64-v8a/libwails\.so' "$RUNNER_TEMP/aab.txt" || { echo "::error::AAB 缺 arm64 libwails.so"; exit 1; }
+          grep -E 'lib/x86_64/libwails\.so' "$RUNNER_TEMP/aab.txt" || { echo "::error::AAB 缺 x86_64 libwails.so"; exit 1; }
+          grep -E 'BundleConfig\.pb' "$RUNNER_TEMP/aab.txt" >/dev/null || { echo "::error::不是合法 AAB（缺 BundleConfig.pb）"; exit 1; }
+
+          echo "=== 3. APK 元数据（包名 / versionName / versionCode）==="
+          APKANALYZER="$(ls "${ANDROID_HOME}"/cmdline-tools/*/bin/apkanalyzer 2>/dev/null | head -1 || true)"
+          if [ -n "$APKANALYZER" ]; then
+            BADGE="$("$APKANALYZER" apk badging "$APK" | tee "$RUNNER_TEMP/badging.txt" || true)"
+            echo "$BADGE" | grep -q "package: name='${EXPECTED_APP_ID}'" \
+              || { echo "::error::包名不是 ${EXPECTED_APP_ID}：$(echo "$BADGE" | grep -m1 '^package:' || echo 无)"; exit 1; }
+            echo "$BADGE" | grep -q "versionCode='${VERSION_CODE}'" \
+              || { echo "::error::versionCode 与期望的 ${VERSION_CODE} 不符（build.gradle 未被正确写入）"; exit 1; }
+            echo "$BADGE" | grep -q "versionName='${VERSION_CORE}'" \
+              || { echo "::error::versionName 与期望的 ${VERSION_CORE} 不符"; exit 1; }
+            echo "包名/版本校验通过：${EXPECTED_APP_ID} ${VERSION_CORE} (code ${VERSION_CODE})"
+
+            echo "=== 4. 签名身份 ==="
+            "$APKANALYZER" apk signing-block "$APK" >/dev/null 2>&1 || true
+            if command -v apksigner >/dev/null 2>&1; then
+              apksigner verify --print-certs "$APK" | head -8 || echo "::warning::apksigner 校验失败"
+            fi
+          else
+            echo "::warning::未找到 apkanalyzer，跳过包名/版本断言"
+            unzip -l "$APK" | grep -E 'lib/(arm64-v8a|x86_64)/libwails\.so' || { echo "::error::APK 缺 native 库"; exit 1; }
+          fi
+
+          echo "=== 5. 前端产物已随 Go 二进制嵌入 ==="
+          # 移动端 assets 由 go:embed 打进 libwails.so，再由 WebViewAssetLoader 提供，
+          # 所以 APK 里不会有独立的 assets/ 条目；用 libwails.so 的体积作为代理指标：
+          # 纯 Go 后端约 20-30MB，前端 dist 再占数 MB，掉到 10MB 以下基本说明 dist 没打进去（白屏）。
+          MIN_BYTES=$((10 * 1024 * 1024))
+          for ABI in arm64-v8a x86_64; do
+            SIZE="$(unzip -v "$AAB" "*/lib/${ABI}/libwails.so" 2>/dev/null | awk '/libwails\.so/{print $1; exit}')"
+            if [ -z "$SIZE" ]; then
+              echo "::warning::AAB 中未取到 lib/${ABI}/libwails.so 的原始大小"
+            elif [ "$SIZE" -lt "$MIN_BYTES" ]; then
+              echo "::error::lib/${ABI}/libwails.so 仅 $SIZE 字节（<10MB），疑似前端 dist 未嵌入"
+              exit 1
+            else
+              echo "lib/${ABI}/libwails.so 原始大小 $SIZE 字节 OK"
+            fi
+          done
+
+          echo "All Android smoke tests passed"
+
+      - name: Collect artifacts
+        shell: bash
+        env:
+          VERSION: ${{ steps.goink_env.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p build/dist
+          mv bin/goink.apk "build/dist/goink-v${VERSION}-android-universal.apk"
+          mv bin/goink.aab "build/dist/goink-v${VERSION}-android.aab"
+          cd build/dist
+          shopt -s nullglob
+          sha256sum *.apk *.aab > sha256sums.tmp
+          mv sha256sums.tmp sha256sums.txt
+          ls -la
+          cat sha256sums.txt
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: android
+          path: build/dist/*
+          if-no-files-found: error
+
+      - name: Attach to GitHub Release
+        if: github.event_name == 'push' || inputs.publish_github
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/dist/*
+          # tag 触发时桌面 release.yml 也在建同一个 release；这里只做追加，
+          # 已存在就复用，避免互相覆盖。
+          append_body: false
+
+      # 配了轨道却没 keystore / 没服务账号 = 明确的操作失误，直接失败说清楚，
+      # 不要让 upload action 用 debug 签名的 AAB 去撞 Play 的 4xx。
+      - name: Require signing when a Play track is set
+        if: inputs.play_track != ''
+        env:
+          PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+          SIGNED: ${{ steps.keystore.outputs.signed }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$SIGNED" != "true" ]; then
+            echo "::error::设置了 play_track 但没有 ANDROID_KEYSTORE_* secrets：AAB 是 debug 签名，Play 会拒收"
+            exit 1
+          fi
+          if [ -z "$PLAY_SERVICE_ACCOUNT_JSON" ]; then
+            echo "::error::设置了 play_track 但没有 PLAY_SERVICE_ACCOUNT_JSON（Google Cloud 服务账号 JSON）"
+            exit 1
+          fi
+          echo "上传目标：package=${{ steps.android_env.outputs.app-id }} track=${{ inputs.play_track }}"
+
+      - name: Upload to Google Play
+        if: inputs.play_track != '' && steps.keystore.outputs.signed == 'true'
+        uses: r0adkll/upload-google-play@v1
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+          packageName: ${{ steps.android_env.outputs.app-id }}
+          releaseFiles: build/dist/*.aab
+          track: ${{ inputs.play_track }}

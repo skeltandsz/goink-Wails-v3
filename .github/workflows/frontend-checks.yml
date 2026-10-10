@@ -1,0 +1,50 @@
+name: Frontend Checks
+
+on:
+  push:
+    branches: [master, dev]
+    paths:
+      - 'frontend/src/**'
+      - 'frontend/package.json'
+      - 'frontend/package-lock.json'
+      - 'frontend/eslint.config.js'
+      - 'frontend/tsconfig.app.json'
+      - 'frontend/scripts/**'
+      - 'frontend/vite.config.ts'
+  pull_request:
+    branches: [master]
+    paths:
+      - 'frontend/src/**'
+      - 'frontend/package.json'
+      - 'frontend/package-lock.json'
+      - 'frontend/eslint.config.js'
+      - 'frontend/tsconfig.app.json'
+      - 'frontend/scripts/**'
+      - 'frontend/vite.config.ts'
+
+jobs:
+  i18n-check:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run i18n consistency check
+        run: npm run i18n:check
+
+      - name: Run theme rules check
+        run: npm run theme:check
+
+      - name: Run TypeScript build check
+        run: npm run build

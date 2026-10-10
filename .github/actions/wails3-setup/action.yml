@@ -1,0 +1,192 @@
+name: 'Goink Wails v3 build environment'
+description: |
+  为 Goink（Wails v3）准备一次构建所需的完整环境：Go/Node 工具链、与 go.mod
+  对齐的 wails3 CLI、各平台 CGO/GUI 依赖，以及 build/runtime（MinGit、
+  ONNX Runtime、BGE 模型）。release.yml 与 build.yml 共用本 action，避免
+  CLI 版本、依赖安装、版本号推导在两个 workflow 里各写一遍而漂移。
+
+inputs:
+  version:
+    description: '显式版本号（不带 v 前缀）；留空则由 tag / git describe 推导'
+    required: false
+    default: ''
+  gui-deps:
+    description: '是否安装桌面 GUI/CGO 系统依赖（GTK/WebKit/sqlite 头文件）。Android 走 NDK 交叉编译，不需要，设 false 可省 1-2 分钟'
+    required: false
+    default: 'true'
+  runtime-deps:
+    description: '是否下载 build/runtime（MinGit + ONNX Runtime + BGE 模型，约数百 MB）。Android 安装包不捆绑这些，设 false 跳过'
+    required: false
+    default: 'true'
+
+outputs:
+  wails-version:
+    description: '与 go.mod 一致的 wails v3 模块版本，如 v3.0.0-beta.28'
+    value: ${{ steps.toolchain.outputs.wails_version }}
+  version:
+    description: '本次构建版本号（原样，用于 -X ldflags 注入），如 1.6.0 / 1.6.0-rc.1 / dev'
+    value: ${{ steps.version.outputs.version }}
+  version-core:
+    description: '规范化 x.y.z 版本号（用于 build/config.yml 的 info.version → NSIS/PE 资源与 Info.plist）；无法规范化时回退 config.yml 现值'
+    value: ${{ steps.version.outputs.version_core }}
+
+runs:
+  using: composite
+  steps:
+    # ---------------------------------------------------------------- 工具链
+    - name: Set up Go
+      uses: actions/setup-go@v6
+      with:
+        go-version: '1.25'
+
+    - name: Set up Node
+      uses: actions/setup-node@v6
+      with:
+        node-version: '24'
+        cache: 'npm'
+        cache-dependency-path: frontend/package-lock.json
+
+    - name: Install wails3 CLI pinned to go.mod
+      id: toolchain
+      shell: bash
+      run: |
+        set -euo pipefail
+        # CLI 版本必须与 go.mod 的 wails/v3 一致：wails3 generate bindings /
+        # build-assets 模板 / Taskfile 约定都跟版本走，错配会生成对不上的脚手架。
+        WAILS_VERSION="$(awk '$1=="github.com/wailsapp/wails/v3"{print $2; exit}' go.mod)"
+        if [ -z "${WAILS_VERSION}" ]; then
+          echo "::error::go.mod 中未找到 github.com/wailsapp/wails/v3，无法确定 wails3 CLI 版本"
+          exit 1
+        fi
+        echo "安装 github.com/wailsapp/wails/v3/cmd/wails3@${WAILS_VERSION}"
+        go install "github.com/wailsapp/wails/v3/cmd/wails3@${WAILS_VERSION}"
+        echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+        echo "wails_version=${WAILS_VERSION}" >> "$GITHUB_OUTPUT"
+        wails3 version --full || wails3 version || true
+
+    # -------------------------------------------------------- 平台编译依赖
+    # v3 的 Linux 默认走 GTK4 + WebKitGTK 6.0；本项目按 docs/AGENTS.md 的既有约定
+    # 使用 legacy 的 -tags gtk3（GTK3 + WebKit2GTK 4.1），v3.1 会移除该 tag，
+    # 届时三处（本 action、workflow 的 EXTRA_TAGS、.golangci.yml build-tags）需同步切换。
+    - name: Install GTK3 / WebKit2GTK / sqlite headers (Linux)
+      if: inputs.gui-deps == 'true' && runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libsqlite3-dev
+
+    # go-sqlite3 自带 sqlite3.c，但 sqlite-vec-go-bindings/cgo 编译时要系统 sqlite3.h，
+    # Windows runner 没有，故下载 amalgamation 头文件并注入 CGO_CFLAGS。
+    # 必须用 $RUNNER_TEMP（Windows 原生路径）：/tmp 在 msys2 bash 下不会映射给 mingw gcc。
+    - name: Install sqlite3 headers (Windows)
+      if: inputs.gui-deps == 'true' && runner.os == 'Windows'
+      shell: bash
+      run: |
+        curl -fsSL --retry 3 -o "$RUNNER_TEMP/sqlite-amalgamation.zip" \
+          "https://www.sqlite.org/2023/sqlite-amalgamation-3440000.zip"
+        unzip -qjo "$RUNNER_TEMP/sqlite-amalgamation.zip" -d "$RUNNER_TEMP/sqlite"
+        echo "CGO_CFLAGS=${CGO_CFLAGS:-} -I${RUNNER_TEMP}/sqlite" >> "$GITHUB_ENV"
+
+    - name: Verify C toolchain (CGO is required for sqlite/ONNX)
+      shell: bash
+      run: |
+        set -euo pipefail
+        if ! command -v gcc >/dev/null 2>&1; then
+          echo "::error::未找到 gcc：-tags cgo 的生产构建需要 CGO。" \
+            "Windows runner 上可用 choco install -y mingw 补装并确认 C:\\mingw64\\bin 在 PATH 首位；" \
+            "Linux 由上一步的 build-essential/gcc 提供；缺 gcc 时 sqlite-vec 与 ONNX 相关代码无法编译。"
+          exit 1
+        fi
+        gcc --version | head -1
+
+    # ------------------------------------------------------ 运行时依赖捆绑
+    - name: Restore runtime deps cache
+      if: inputs.runtime-deps == 'true'
+      id: cache-runtime
+      uses: actions/cache@v5
+      with:
+        path: build/runtime
+        key: runtime-${{ runner.os }}-${{ hashFiles('scripts/download-git.sh', 'scripts/download-onnx.sh') }}
+
+    - name: Download runtime deps (Git + ONNX Runtime + BGE model)
+      if: inputs.runtime-deps == 'true' && steps.cache-runtime.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        bash scripts/download-git.sh
+        bash scripts/download-onnx.sh
+
+    # ---------------------------------------------------------------- 前端
+    - name: Install frontend deps (npm ci)
+      shell: bash
+      working-directory: frontend
+      # 显式 npm ci 锁定安装；后续 Taskfile 的 install:frontend:deps 会因
+      # node_modules 已就绪且 sources 未变而跳过（不会二次安装）。
+      run: npm ci --no-audit --no-fund
+
+    # ------------------------------------------------------------- 版本号
+    - name: Resolve version
+      id: version
+      shell: bash
+      env:
+        INPUT_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        VERSION="${INPUT_VERSION}"
+        if [ -z "${VERSION}" ]; then
+          if [[ "${GITHUB_REF_NAME}" =~ ^v[0-9] ]]; then
+            # tag push：v1.6.0 -> 1.6.0
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            # ci-* 测试分支 / workflow_dispatch：尽量给出可追溯标识
+            VERSION="$(git describe --tags --always --dirty 2>/dev/null | sed 's/^v//' || echo dev)"
+          fi
+        fi
+        # x.y.z 规范化：PE 版本资源 / NSIS VIProductVersion / CFBundleShortVersionString
+        # 只接受数字分段，带 -rc.1/-dirty 后缀时必须降级处理。
+        if [[ "${VERSION}" =~ ^([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+          VERSION_CORE="${BASH_REMATCH[1]}"
+        else
+          VERSION_CORE="$(awk '$1=="version:"{gsub(/"/,"",$2); print $2; exit}' build/config.yml)"
+          echo "::warning::版本 ${VERSION} 不是 x.y.z 形式，安装包元数据沿用 build/config.yml 的 ${VERSION_CORE}"
+        fi
+        echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+        echo "version_core=${VERSION_CORE}" >> "$GITHUB_OUTPUT"
+        echo "本次构建：version=${VERSION}  version-core=${VERSION_CORE}"
+
+    # 把版本写进 build/config.yml，再由 update build-assets 渲染到
+    # info.json（PE 资源）/ Info.plist（macOS bundle）/ wails_tools.nsh（NSIS 元数据）。
+    - name: Sync version into build/config.yml
+      shell: bash
+      env:
+        VERSION_CORE: ${{ steps.version.outputs.version_core }}
+      run: |
+        set -euo pipefail
+        sed -i.bak "s/^  version: .*/  version: \"${VERSION_CORE}\"/" build/config.yml
+        rm -f build/config.yml.bak
+        grep -n '^  version:' build/config.yml
+
+    # v3 脚手架按需生成：wails.exe.manifest、nsis/wails_tools.nsh、darwin/Info.plist
+    # 都是 update build-assets 的产物且不入库（见 .gitignore 说明）；project.nsi 与
+    # 各平台 Taskfile.yml 不在 updatable_build_assets 内，不会被覆盖。
+    - name: Sync Wails build assets
+      shell: bash
+      run: wails3 task common:update:build-assets
+
+    - name: Restore styled DMG assets (macOS)
+      if: runner.os == 'macOS'
+      shell: bash
+      env:
+        WAILS_VERSION: ${{ steps.toolchain.outputs.wails_version }}
+      run: |
+        set -euo pipefail
+        # wails3 tool package --format dmg 会校验背景图/文件图标存在（dmg.go 的
+        # SetBackgroundImage 缺文件即报错）。这两个是 build_assets 里的静态资产，
+        # update build-assets 不会生成，故按 CLI 同版本从上游取回。
+        base="https://raw.githubusercontent.com/wailsapp/wails/${WAILS_VERSION}/v3/internal/commands/build_assets/darwin"
+        for f in dmg-background.png dmg-file-icon.icns; do
+          if [ ! -e "build/darwin/${f}" ]; then
+            echo "下载 ${f}"
+            curl -fsSL --retry 3 -o "build/darwin/${f}" "${base}/${f}"
+          fi
+        done
+        ls -la build/darwin

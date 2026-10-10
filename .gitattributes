@@ -1,0 +1,14 @@
+# 旧版 Python 实现，排除在语言统计外
+python-master/** linguist-vendored
+
+# 第三方依赖（onnxruntime_go 上游源码及其补丁），排除在语言统计外
+third_party/** linguist-vendored
+
+# Android/Gradle：gradlew 是 sh 脚本，wrapper 的 jar 是二进制。
+# Windows 上 core.autocrlf=true 会把 gradlew 转成 CRLF，Linux runner 执行时报
+# "/usr/bin/env: 'sh\r': No such file or directory"，所以行尾必须锁死。
+gradlew text eol=lf
+gradlew.bat text eol=crlf
+gradle-wrapper.properties text eol=lf
+gradle-wrapper.jar binary
+*.jar binary

@@ -1,0 +1,54 @@
+name: Test
+
+on:
+  push:
+    branches: [master, dev]
+  pull_request:
+    branches: [master]
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      CGO_ENABLED: 1
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.25"
+
+      - name: Install sqlite3 headers (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/sqlite-amalgamation.zip" "https://www.sqlite.org/2023/sqlite-amalgamation-3440000.zip"
+          unzip -qjo "$RUNNER_TEMP/sqlite-amalgamation.zip" -d "$RUNNER_TEMP/sqlite"
+          echo "CGO_CFLAGS=${CGO_CFLAGS} -I${RUNNER_TEMP}/sqlite" >> $GITHUB_ENV
+
+      - name: Install Wails v3 Linux build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          # app/ 与 main.go 引入 wails/v3/pkg/application；Linux 下该包是 cgo 实现，
+          # 类型检查/链接需要 GTK 与 WebKitGTK 开发头文件（v3 默认 GTK4 + WebKit 6.0，
+          # 本项目按 docs/MIGRATION_WAILS_V3.md 走 legacy gtk3 路径，见下方 GO_TAGS）。
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libsqlite3-dev
+
+      - name: Resolve Go build tags
+        shell: bash
+        run: |
+          # Linux 需要 gtk3（与生产构建一致）；Windows/macOS 的 v3 后端不依赖该 tag。
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            echo "GO_TAGS=-tags=gtk3" >> "$GITHUB_ENV"
+          else
+            echo "GO_TAGS=" >> "$GITHUB_ENV"
+          fi
+
+      - name: Run tests
+        # 显式 bash：默认 shell 在 Windows 上是 pwsh，$GO_TAGS 不会展开
+        shell: bash
+        run: go test $GO_TAGS $(go list ./internal/... ./app/...) -count=1

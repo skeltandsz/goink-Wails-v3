@@ -1,0 +1,45 @@
+version: "2"
+
+run:
+  timeout: 10m
+  go: "1.25"
+  build-tags:
+    # 与 Linux 生产构建（wails3 build -tags cgo,gtk3）对齐。
+    # cgo 决定 internal/rag（ONNX embedder、VectorStore、RefreshQueue）与
+    # internal/mcp_tools/memory_tools.go 是否参与分析——留空时这些文件被整体
+    # 跳过，等于这部分代码从不被 lint。
+    # gtk3 是 Wails v3 的 legacy Linux 路径标签；v2 时代的 webkit2_41 在 v3 无效。
+    - cgo
+    - gtk3
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+  exclusions:
+    paths:
+      - "frontend/node_modules"
+      - "dev_test"
+      - "scripts"
+      - "build"
+    rules:
+      # 清理函数（defer Close/Rollback/Destroy）不检查返回值是行业惯例
+      - linters: [errcheck]
+        text: "Error return value of `.+\\.(Close|Rollback|Destroy)` is not checked"
+      # 测试文件不检查 errcheck（测试 helper 常忽略错误，golangci-lint 官方示例做法）
+      - path: _test\.go
+        linters: [errcheck]
+      # defer 清理临时文件，失败无法恢复
+      - linters: [errcheck]
+        source: "defer\\s+os\\.Remove"
+      # gorm 事务内追加错误，返回 *gorm.DB 无意义
+      - linters: [errcheck]
+        source: "\\.AddError\\("
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

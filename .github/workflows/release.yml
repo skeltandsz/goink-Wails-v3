@@ -1,0 +1,341 @@
+name: Release
+
+# 触发方式（沿用 v2 时期的约定）：
+#   - 打 tag v*         → 三平台构建 + 发布 GitHub Release
+#   - push 到 ci-* 分支 → 三平台构建，只出 artifact，不发布（用于验证流水线）
+#   - workflow_dispatch → 手动构建；填 version 可指定版本号
+#
+# 与 v2 流水线的主要差异（Wails v3 / beta.28）：
+#   1. CLI 换成 wails3，且版本随 go.mod 的 wails/v3 走（见 .github/actions/wails3-setup）。
+#   2. 构建产物目录由 build/bin 变为仓库根 bin/（根 Taskfile 的 BIN_DIR）。
+#   3. build tag 由 webkit2_41 改为 production(自动) + EXTRA_TAGS=cgo[,gtk3]；
+#      不带 cgo 时 ONNX/sqlite-vec/memory_tools 会被整块编译掉。
+#   4. 版本号注入走 Taskfile 新增的 EXTRA_LDFLAGS 钩子；安装包元数据
+#      （PE 资源 / NSIS / Info.plist）由 build/config.yml 的 info.version 渲染。
+#   5. Windows 由 Inno Setup 改为 v3 原生 NSIS；macOS 由自写 build-dmg.sh 改为
+#      wails3 的 create:app:bundle + create:dmg（runtime 注入已并入 Taskfile）。
+
+on:
+  push:
+    tags:
+      - 'v*'
+    branches:
+      - 'ci-*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（不带 v 前缀，留空则由 tag / git describe 推导）'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  # tag 构建一旦开始不要中断（发布物不完整比慢更糟）
+  cancel-in-progress: false
+
+env:
+  # 与 internal/version.Version 的导入路径一致，改包名时同步这里
+  VERSION_LDFLAG: -X=github.com/sigpanic/goink/internal/version.Version
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    env:
+      CGO_ENABLED: '1'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # git describe --tags 需要 tag 历史，浅克隆会退化成 commit hash
+          fetch-depth: 0
+
+      - name: Prepare build environment
+        id: goink_env
+        uses: ./.github/actions/wails3-setup
+        with:
+          version: ${{ inputs.version }}
+
+      - name: Install NSIS
+        shell: bash
+        run: |
+          set -euo pipefail
+          choco install -y nsis --limit-output
+          # 当前 job 的 PATH 是开跑时的快照，choco 写入的系统 PATH 不会自动生效
+          echo 'C:\Program Files (x86)\NSIS' >> "$GITHUB_PATH"
+
+      - name: Build and package (wails3 → NSIS)
+        shell: bash
+        env:
+          VERSION: ${{ steps.goink_env.outputs.version }}
+        run: |
+          set -euo pipefail
+          # windows:package → create:nsis:installer → deps: build → build:native，
+          # 一次调用完成 前端构建 + 图标/syso + go build + makensis。
+          # EXTRA_LDFLAGS 用 -X= 形式（无空格）：Task 的 KEY=VALUE 传参按空格切分，
+          # "-X pkg.Var=val" 里的空格会被吞掉。
+          wails3 task windows:package \
+            FORMAT=nsis \
+            ARCH=amd64 \
+            CGO_ENABLED=1 \
+            EXTRA_TAGS=cgo \
+            EXTRA_LDFLAGS="${VERSION_LDFLAG}=${VERSION}"
+
+      - name: Collect artifacts
+        shell: bash
+        env:
+          VERSION: ${{ steps.goink_env.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p build/dist
+          # project.nsi 的 OutFile 固定写到仓库根 bin/：goink-amd64-installer.exe
+          src=$(ls bin/*installer*.exe | head -1)
+          [ -n "$src" ] || { echo "::error::未找到 NSIS 安装包（bin/ 下无 *installer*.exe）"; exit 1; }
+          mv "$src" "build/dist/goink-v${VERSION}-windows-amd64-installer.exe"
+          ls -la build/dist
+
+      - name: Smoke test (Windows)
+        shell: bash
+        run: |
+          set -euo pipefail
+          EXE=bin/goink.exe
+          INSTALLER=$(ls build/dist/*windows-amd64-installer.exe | head -1)
+
+          echo "=== 1. 主二进制格式 ==="
+          file "$EXE"
+          file "$EXE" | grep -q "PE32+" || { echo "::error::goink.exe 不是 PE32+"; exit 1; }
+
+          echo "=== 2. 安装包存在 ==="
+          [ -n "$INSTALLER" ] || { echo "::error::build/dist/ 下无安装包"; exit 1; }
+          ls -la "$INSTALLER"
+
+          echo "=== 3. PE 版本资源（来自 build/config.yml → info.json → syso）==="
+          powershell -NoProfile -Command "(Get-Item 'bin\goink.exe').VersionInfo | Format-List FileVersion,ProductVersion,ProductName,CompanyName" || true
+
+          echo "=== 4. runtime 暂存区完整（安装包内容来源）==="
+          [ -f build/runtime/git/mingw64/bin/git.exe ] || { echo "::error::MinGit 缺失"; exit 1; }
+          [ -f build/runtime/onnxruntime.dll ] || { echo "::error::onnxruntime.dll 缺失"; exit 1; }
+          for dll in vcruntime140.dll vcruntime140_1.dll msvcp140.dll; do
+            [ -f "build/runtime/$dll" ] || { echo "::error::$dll 缺失（VC++ Runtime 未捆绑）"; exit 1; }
+          done
+          [ -f build/runtime/models/model.onnx ] || echo "::warning::BGE 模型缺失，安装包将不含离线模型"
+
+          echo "=== 5. 安装包内含 runtime（软校验：7z 能列出即确认）==="
+          SEVENZ='/c/Program Files/7-Zip/7z.exe'
+          if [ -x "$SEVENZ" ]; then
+            LIST="$($SEVENZ l "$INSTALLER" 2>/dev/null || true)"
+            if echo "$LIST" | grep -q "runtime"; then
+              echo "安装包内可见 runtime 条目："
+              echo "$LIST" | grep -E "runtime/(git/mingw64/bin/git.exe|onnxruntime.dll|vcruntime140.dll)" || true
+            else
+              echo "::warning::7z 未能列出 NSIS 内容，跳过该检查（请人工确认安装包内含 runtime/）"
+            fi
+          else
+            echo "::warning::未找到 7z，跳过安装包内容检查"
+          fi
+
+          echo "All Windows smoke tests passed"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows
+          path: build/dist/*
+          if-no-files-found: error
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Prepare build environment
+        id: goink_env
+        uses: ./.github/actions/wails3-setup
+        with:
+          version: ${{ inputs.version }}
+
+      - name: Build and package (wails3 → .app → DMG)
+        env:
+          VERSION: ${{ steps.goink_env.outputs.version }}
+        run: |
+          set -euo pipefail
+          # darwin:package:dmg = build:native（CGO_ENABLED=1 由 Taskfile 固定）
+          #   → create:app:bundle（含我们追加的 runtime 注入 + ad-hoc 签名）→ create:dmg。
+          # macos-latest 是 arm64；需要 universal 时改用 task darwin:package:universal
+          # 并按 arch 各下一份 ONNX Runtime。
+          wails3 task darwin:package:dmg \
+            EXTRA_TAGS=cgo \
+            EXTRA_LDFLAGS="${VERSION_LDFLAG}=${VERSION}"
+
+      - name: Collect artifacts
+        env:
+          VERSION: ${{ steps.goink_env.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p build/dist
+          src=$(ls bin/*.dmg | head -1)
+          [ -n "$src" ] || { echo "::error::未找到 DMG（bin/ 下无 .dmg）"; exit 1; }
+          mv "$src" "build/dist/goink-v${VERSION}-macos-arm64.dmg"
+          ls -la build/dist
+
+      - name: Smoke test (macOS)
+        run: |
+          set -euo pipefail
+          APP="bin/goink.app"
+
+          echo "=== 1. bundle 结构 ==="
+          [ -x "$APP/Contents/MacOS/goink" ] || { echo "::error::缺主可执行文件"; exit 1; }
+          [ -f "$APP/Contents/Info.plist" ] || { echo "::error::缺 Info.plist"; exit 1; }
+          plutil -p "$APP/Contents/Info.plist" | grep -E 'CFBundle(Short)?Version|CFBundleIdentifier' || true
+
+          echo "=== 2. runtime 已注入 bundle（Taskfile 的 create:app:bundle 追加段）==="
+          RT="$APP/Contents/Resources/runtime"
+          [ -x "$RT/git/git" ] || { echo "::error::bundle 内缺 bundled git：$RT/git/git"; exit 1; }
+          ls "$RT"/libonnxruntime*.dylib* || { echo "::error::bundle 内缺 libonnxruntime"; exit 1; }
+          [ -d "$RT/models" ] || echo "::warning::bundle 内缺 models/（语义模型未下载？）"
+
+          echo "=== 3. codesign --verify --deep --strict（seal 一致性）==="
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          echo "$APP: codesign --verify 通过"
+
+          echo "=== 4. 主二进制 / 嵌套库架构 ==="
+          file "$APP/Contents/MacOS/goink" | grep -q "arm64" || { echo "::error::主二进制不是 arm64"; exit 1; }
+          DYLIB=$(ls "$RT"/libonnxruntime.*.dylib 2>/dev/null | head -1)
+          [ -n "$DYLIB" ] || DYLIB="$RT/libonnxruntime.dylib"
+          [ -e "$DYLIB" ] || { echo "::error::libonnxruntime.dylib 缺失"; exit 1; }
+          file "$DYLIB" | grep -q "arm64" || { echo "::error::libonnxruntime 不是 arm64"; exit 1; }
+          file "$RT/git/git" | grep -q "arm64" || echo "::warning::bundled git 架构异常：$(file "$RT/git/git")"
+
+          echo "=== 5. 挂载 DMG 校验最终交付物 ==="
+          DMG=$(ls build/dist/*.dmg | head -1)
+          MOUNT=$(hdiutil attach "$DMG" -nobrowse -noautoopen | grep -E '/Volumes/' | awk '{print $NF}')
+          VOL_APP=$(find "$MOUNT" -maxdepth 2 -name '*.app' | head -1)
+          [ -n "$VOL_APP" ] || { hdiutil detach "$MOUNT" 2>/dev/null || true; echo "::error::DMG 内未找到 .app"; exit 1; }
+          echo "VOL_APP: $VOL_APP"
+          codesign --verify --deep --strict --verbose=2 "$VOL_APP"
+          [ -x "$VOL_APP/Contents/Resources/runtime/git/git" ] \
+            || { hdiutil detach "$MOUNT" 2>/dev/null || true; echo "::error::DMG 内 bundle 缺 bundled git（runtime 注入未生效）"; exit 1; }
+          hdiutil detach "$MOUNT" 2>/dev/null || true
+
+          echo "All macOS smoke tests passed"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos
+          path: build/dist/*
+          if-no-files-found: error
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Prepare build environment
+        id: goink_env
+        uses: ./.github/actions/wails3-setup
+        with:
+          version: ${{ inputs.version }}
+
+      - name: Build (wails3 → bin/goink)
+        env:
+          VERSION: ${{ steps.goink_env.outputs.version }}
+        run: |
+          set -euo pipefail
+          # -tags gtk3 = v3 的 legacy GTK3/WebKit2GTK 4.1 路径（默认是 GTK4 +
+          # WebKitGTK 6.0），与 AGENTS.md 记录的系统依赖一致；v3.1 起移除。
+          wails3 build \
+            -tags cgo,gtk3 \
+            EXTRA_LDFLAGS="${VERSION_LDFLAG}=${VERSION}"
+
+      - name: Package (AppImage)
+        env:
+          VERSION: ${{ steps.goink_env.outputs.version }}
+        run: |
+          set -euo pipefail
+          # 这里保留项目自带脚本而非 wails3 task linux:create:appimage：
+          # 原生 create:appimage 走 `wails3 generate appimage`，只接收
+          # binary/icon/desktop 三项，没有把 build/runtime（git + onnxruntime +
+          # models）放进 AppDir 的扩展点；而 internal/platform 在 Linux 上按
+          # <exe 目录>/runtime/ 查找，缺了就没有 bundled git 与语义检索。
+          # 脚本自身已处理 appimagetool 的 --appimage-extract-and-run（免 FUSE）。
+          mkdir -p build/bin
+          cp bin/goink build/bin/goink
+          bash build/package/linux/build-appimage.sh "$VERSION"
+
+      - name: Smoke test (Linux)
+        run: |
+          set -euo pipefail
+          echo "=== 1. 产物架构 ==="
+          file bin/goink | grep -q 'x86-64' || { echo "::error::goink 不是 x86-64"; exit 1; }
+          file bin/goink
+
+          echo "=== 2. 动态依赖可解析 ==="
+          ldd bin/goink | head -20
+          if ldd bin/goink | grep -q 'not found'; then
+            echo '::error::ldd 报 not found'
+            ldd bin/goink | grep 'not found'
+            exit 1
+          fi
+
+          echo "=== 3. cgo 代码确实被编进去 ==="
+          # -tags cgo 漏掉时，ONNX/vector_store/memory_tools 会整块消失，
+          # 表现为符号表里没有 onnxruntime 相关引用。
+          if command -v nm >/dev/null 2>&1; then
+            nm bin/goink 2>/dev/null | grep -qi 'onnxruntime\|sqlite-vec\|vector' \
+              || echo "::warning::符号表未见 ONNX/sqlite-vec 痕迹，请确认 -tags cgo 生效"
+          fi
+
+          echo "=== 4. AppImage 存在且可解压 ==="
+          APPIMAGE=$(ls build/dist/*.AppImage | head -1)
+          [ -n "$APPIMAGE" ] || { echo '::error::build/dist/ 下无 .AppImage'; exit 1; }
+          chmod +x "$APPIMAGE"
+          file "$APPIMAGE"
+          "$APPIMAGE" --appimage-extract >/dev/null 2>&1 \
+            && echo "AppImage 可解压" \
+            || echo "::warning::AppImage 解压测试失败（非致命）"
+          # 校验 runtime 落在 AppDir 根部（与 exe 同级，符合 platform.AppDir 查找）
+          ls squashfs-root/runtime >/dev/null 2>&1 \
+            && echo "AppDir 内含 runtime/" \
+            || echo "::warning::未在解压结果中找到 runtime/（可能解压目录名不同，请人工确认）"
+          rm -rf squashfs-root
+
+          echo "All Linux smoke tests passed"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux
+          path: build/dist/*
+          if-no-files-found: error
+
+  release:
+    needs: [build-windows, build-macos, build-linux]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+
+      - name: Collect artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp windows/* dist/ 2>/dev/null || true
+          cp linux/* dist/ 2>/dev/null || true
+          cp macos/* dist/ 2>/dev/null || true
+          cd dist
+          shopt -s nullglob
+          # 只校验交付物；先写临时文件再改名，避免 sha256sums.txt 把自己算进去
+          sha256sum *.exe *.AppImage *.dmg > sha256sums.tmp
+          mv sha256sums.tmp sha256sums.txt
+          cat sha256sums.txt
+
+      - name: Upload Release Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

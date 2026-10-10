@@ -1,0 +1,150 @@
+name: Build Check
+
+# PR / master / dev 上的三平台构建冒烟：只跑 wails3 build（不打包、不发布），
+# 目的是在打 tag 之前发现 v3 侧的构建回归——这类问题 release.yml 要到发版才暴露：
+#   - 根 Taskfile / build/*/Taskfile.yml 语法或 include 缺失（全新 clone 才会踩到）
+#   - -tags cgo 相关的编译失败（ONNX / sqlite-vec / memory_tools）
+#   - 前端构建与 wails3 generate bindings 漂移
+# 完整打包（NSIS / DMG / AppImage）仍由 release.yml 在 tag 上验证。
+
+on:
+  push:
+    branches: [master, dev]
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-check-${{ github.ref }}
+  # PR 迭代时取消旧构建；push 到分支的构建不做该优化也无害
+  cancel-in-progress: true
+
+env:
+  VERSION_LDFLAG: -X=github.com/sigpanic/goink/internal/version.Version
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            artifact_name: goink-windows-amd64
+            binary: bin/goink.exe
+            # 只有 Windows 的 build:native 默认 CGO_ENABLED=0，需显式打开
+            build_args: -tags cgo CGO_ENABLED=1
+          - runner: macos-latest
+            artifact_name: goink-macos-arm64
+            binary: bin/goink
+            # darwin:build:native 内已固定 CGO_ENABLED=1
+            build_args: -tags cgo
+          - runner: ubuntu-latest
+            artifact_name: goink-linux-amd64
+            binary: bin/goink
+            # gtk3 = v3 的 legacy GTK3/WebKit2GTK 4.1 路径，与 AGENTS.md 依赖一致
+            build_args: -tags cgo,gtk3
+    name: Build (${{ matrix.artifact_name }})
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Prepare build environment
+        id: goink_env
+        uses: ./.github/actions/wails3-setup
+        # 不传 version：由 tag / git describe 推导，PR 合并引用下会得到
+        # 形如 1.6.0-14-gabcd123 的可追溯串，用于校验 ldflags 注入是否生效。
+
+      - name: Build
+        shell: bash
+        env:
+          VERSION: ${{ steps.goink_env.outputs.version }}
+        run: |
+          set -euo pipefail
+          wails3 build ${{ matrix.build_args }} \
+            EXTRA_LDFLAGS="${VERSION_LDFLAG}=${VERSION}"
+
+      - name: Verify build settings (tags / CGO / ldflags)
+        shell: bash
+        env:
+          VERSION: ${{ steps.goink_env.outputs.version }}
+        run: |
+          set -euo pipefail
+          BIN='${{ matrix.binary }}'
+          [ -f "$BIN" ] || { echo "::error::产物缺失：$BIN"; exit 1; }
+
+          echo "=== 架构 ==="
+          file "$BIN"
+
+          echo "=== go version -m：确认 -tags/CGO_ENABLED/-ldflags 已生效 ==="
+          # 这些 build settings 由 cmd/go 记录在二进制里，比翻日志更可靠。
+          # 缺 cgo tag 时 ONNX/vector_store/memory_tools 会被整块编译掉，
+          # 表现就是这里看不到 tags=cgo...。
+          go version -m "$BIN" | tee "$RUNNER_TEMP/buildinfo.txt"
+          go version -m "$BIN" | grep -q 'tags=' \
+            || echo "::warning::未在 build settings 中看到 tags=，请确认 -tags 已传入"
+          go version -m "$BIN" | grep -q "Version=${VERSION}" \
+            || { echo "::error::版本号未注入（期望 internal/version.Version=${VERSION}）"; exit 1; }
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.binary }}
+          retention-days: 7
+          if-no-files-found: error
+
+  # Android 单独一个 job：它要 NDK + JDK + Gradle，和桌面三平台的依赖集合完全不同；
+  # 且 Wails v3 的 Android 支持仍是 experimental，交叉编译最容易在这里回归
+  # （典型症状：//go:build cgo 的文件在 android 下找不到对应库、
+  # 只给桌面 Linux 用的文件缺 `linux && !android` 约束）。
+  android:
+    name: Build (android-arm64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Prepare Wails toolchain
+        id: goink_env
+        uses: ./.github/actions/wails3-setup
+        with:
+          gui-deps: 'false'
+          runtime-deps: 'false'
+
+      - name: Prepare Android toolchain
+        uses: ./.github/actions/android-setup
+        with:
+          version: ${{ steps.goink_env.outputs.version }}
+          version-core: ${{ steps.goink_env.outputs.version-core }}
+
+      - name: Build release APK (arm64)
+        env:
+          VERSION: ${{ steps.goink_env.outputs.version }}
+          APP_ID: com.sigpanic.goink
+        run: |
+          set -euo pipefail
+          # PR 校验只出单 ABI APK：比 bundle:fat 少一次 amd64 交叉编译，
+          # 足以验证 GOOS=android + NDK 那条链路是否还能编过。
+          wails3 task android:package \
+            ARCH=arm64 \
+            APP_ID="${APP_ID}" \
+            EXTRA_LDFLAGS="${VERSION_LDFLAG}=${VERSION}"
+
+      - name: Verify APK
+        run: |
+          set -euo pipefail
+          ls -la bin/goink.apk
+          [ -s bin/goink.apk ] || { echo "::error::APK 为空"; exit 1; }
+          unzip -l bin/goink.apk | grep -E 'lib/arm64-v8a/libwails\.so' \
+            || { echo "::error::APK 内缺 libwails.so（Go 代码没进包）"; exit 1; }
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: goink-android-arm64
+          path: bin/goink.apk
+          retention-days: 7
+          if-no-files-found: error

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=goink
+Exec=goink
+Icon=goink
+Categories=Development;
+Terminal=false
+Keywords=wails
+Version=1.0
+StartupNotify=false

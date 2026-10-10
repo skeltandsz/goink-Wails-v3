@@ -1,0 +1,99 @@
+package app
+
+import (
+	"fmt"
+
+	"gorm.io/gorm"
+
+	"github.com/sigpanic/goink/internal/character"
+	"github.com/sigpanic/goink/internal/storage"
+)
+
+// GetCharacters 返回指定小说的全部角色，供前端侧边栏列表和关系图节点渲染。
+// 4b: 改调 ListByNovel(Size=-1) 全量（废弃 ListAllByNovel），传 Order="name ASC"
+// 保持原 ListAllByNovel 的 name 升序行为。MCP 不传 Order，走默认 updated_at DESC。
+func (a *App) GetCharacters(novelID int64) ([]character.Character, error) {
+	result, err := a.character.ListByNovel(a.ctx, novelID, character.ListByNovelOptions{
+		PageParams: storage.PageParams{Size: -1},
+		Order:      "name ASC",
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result.Items, nil
+}
+
+// GetCharacterRelations 返回指定小说的全部当前角色关系（有向边），供前端关系图渲染。
+func (a *App) GetCharacterRelations(novelID int64) ([]character.CharacterRelation, error) {
+	return a.character.ListCurrentByNovel(a.ctx, novelID)
+}
+
+// ── Character CRUD ──────────────────────────────────────
+
+// CreateCharacterInput 是 CreateCharacter 的参数。
+type CreateCharacterInput struct {
+	Name        string `json:"name"`                  // 角色名称，必填
+	Description string `json:"description,omitempty"` // 自然语言描述
+	Personality string `json:"personality,omitempty"` // JSON 自由格式，如 {"traits":["勇敢","冲动"]}
+	Abilities   string `json:"abilities,omitempty"`   // JSON 数组，如 ["剑术","隐身"]
+}
+
+// CreateCharacter 创建一个角色。
+func (a *App) CreateCharacter(novelID int64, input CreateCharacterInput) (*character.Character, error) {
+	if input.Name == "" {
+		return nil, fmt.Errorf("角色名称不能为空")
+	}
+	char := character.Character{
+		NovelID:     novelID,
+		Name:        input.Name,
+		Description: input.Description,
+		Personality: input.Personality,
+		Abilities:   input.Abilities,
+	}
+	if err := a.character.DB.WithContext(a.ctx).Create(&char).Error; err != nil {
+		return nil, fmt.Errorf("create character: %w", err)
+	}
+	return &char, nil
+}
+
+// UpdateCharacterInput 采用 PUT 语义：前端全量传，后端全量覆盖。
+// Personality 是 AI 写入字段，不在 input 里，后端 First 加载原值保留。
+type UpdateCharacterInput struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Abilities   string `json:"abilities"`
+}
+
+// UpdateCharacter 更新角色。PUT 全量覆盖用户可编辑字段。
+func (a *App) UpdateCharacter(novelID int64, charID int64, input UpdateCharacterInput) error {
+	var ch character.Character
+	if err := a.character.DB.WithContext(a.ctx).
+		Where("id = ? AND novel_id = ?", charID, novelID).
+		First(&ch).Error; err != nil {
+		return fmt.Errorf("update character: %w", err)
+	}
+	// PUT 全量覆盖用户可编辑字段。Personality 是 AI 写入字段，不在 input 里，
+	// 保留 First 加载的原值，避免前端编辑保存覆盖 AI 写入的新值（lost update）。
+	ch.Name = input.Name
+	ch.Description = input.Description
+	ch.Abilities = input.Abilities
+	if err := a.character.DB.WithContext(a.ctx).Save(&ch).Error; err != nil {
+		return fmt.Errorf("update character: %w", err)
+	}
+	return nil
+}
+
+// DeleteCharacter 删除角色（级联删除关联的关系记录）。
+func (a *App) DeleteCharacter(novelID int64, charID int64) error {
+	return a.character.DB.WithContext(a.ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("(source_character_id = ? OR target_character_id = ?) AND novel_id = ?", charID, charID, novelID).
+			Delete(&character.CharacterRelation{}).Error; err != nil {
+			return fmt.Errorf("delete character relations: %w", err)
+		}
+		if err := tx.Where("id = ? AND novel_id = ?", charID, novelID).
+			Delete(&character.Character{}).Error; err != nil {
+			return fmt.Errorf("delete character: %w", err)
+		}
+		return nil
+	})
+}

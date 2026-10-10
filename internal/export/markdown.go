@@ -1,0 +1,54 @@
+package export
+
+import (
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/sigpanic/goink/internal/novel"
+)
+
+func exportMarkdown(n *novel.Novel, chapters []ChapterWithContent) ([]byte, string, error) {
+	var b strings.Builder
+
+	// 书名 + 元信息
+	fmt.Fprintf(&b, "# %s\n\n", n.Title)
+	if n.Genre != "" {
+		fmt.Fprintf(&b, "**类型**: %s  \n", n.Genre)
+	}
+	if n.Description != "" {
+		fmt.Fprintf(&b, "**简介**: %s  \n", n.Description)
+	}
+	fmt.Fprintf(&b, "**导出时间**: %s  \n", time.Now().Format("2006-01-02 15:04"))
+	b.WriteString("\n---\n\n")
+
+	// 目录
+	b.WriteString("## 目录\n\n")
+	for _, cc := range chapters {
+		ch := cc.Chapter
+		title := ch.Title
+		if title == "" {
+			title = fmt.Sprintf("第%d章", ch.ReadingNumber)
+		}
+		fmt.Fprintf(&b, "- [第%d章 %s](#第%d章)\n\n", ch.ReadingNumber, title, ch.ReadingNumber)
+	}
+	b.WriteString("\n---\n\n")
+
+	// 正文
+	for _, cc := range chapters {
+		ch := cc.Chapter
+		title := ch.Title
+		if title == "" {
+			title = fmt.Sprintf("第%d章", ch.ReadingNumber)
+		}
+		fmt.Fprintf(&b, "## 第%d章 %s\n\n", ch.ReadingNumber, title)
+		b.WriteString(cc.Content)
+		b.WriteString("\n\n")
+	}
+
+	filename, err := DefaultFilename(n, "markdown")
+	if err != nil {
+		return nil, "", err
+	}
+	return []byte(b.String()), filename, nil
+}

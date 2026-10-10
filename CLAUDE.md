@@ -1,0 +1,102 @@
+# CLAUDE.md
+
+Goink — desktop AI novel-writing assistant built with Wails (Go + React).
+
+## Build / Dev
+
+```bash
+make deps      # download runtime deps (ONNX lib, git, models)
+make build     # production build (wails build)
+make dev       # dev mode with hot reload (wails dev)
+```
+
+**Working directory discipline (dual-worktree aware):**
+
+This repo uses `git worktree` — see `.trae/rules/worktree协作流程.md` for the full layout. Two worktrees share one `.git`; one agent per worktree, never two agents in the same worktree.
+
+| worktree | dir | branch | role |
+|---|---|---|---|
+| main | `/home/nianhe/projects/todo` | `master` | agent 1 works directly on master |
+| secondary | `/home/nianhe/projects/goink` | `dev` (cut from master) | agent 2 works on this dev branch |
+
+- **Stay in your own worktree** — read, edit, and run commands only inside the worktree you were invoked in (the *Primary working directory* shown in your environment). Never `cd` into the other worktree to read or edit files: the other worktree may be on a different branch with stale or divergent code, and cross-worktree edits risk clobbering the other agent's in-flight work. If you were invoked in `goink`, treat `goink/` as your root; if in `todo`, treat `todo/` as your root.
+- **Git commands** — run from the *current worktree's* root (the dir you were invoked in), not a hardcoded path. `log`/`status`/`diff`/`build`/`test` all reflect the current worktree's HEAD; redirecting them to the other worktree reads the wrong branch. Before any git operation, confirm CWD is the current worktree root.
+- **Frontend commands** — always `cd frontend/` first (relative to current worktree root). Build with `npm run build`, never raw `npx vite build` or `npm build`. Install deps with `npm install <pkg> --save` from within `frontend/`. NEVER run `npm install` from project root.
+- **Go commands** — run from current worktree root. Use `go build ./...` or `go test ./...`.
+- **Know where you are** — before running any command, confirm which directory it will execute in, which worktree that belongs to, and what side effects it has. When two rules conflict, the more specific / more recent one wins (worktree rules override legacy single-worktree paths).
+
+System deps (Ubuntu/Debian): `libsqlite3-dev libgtk-3-dev libwebkit2gtk-4.1-dev gcc`
+
+ONNX Runtime and models are bundled at build time via `scripts/download-onnx.sh` into `build/runtime/`. In dev mode, the ONNX lib fallback path is `~/Goink/runtime/` and models fall back to `~/Goink/models/`. Build constraint `//go:build cgo` guards all ONNX and sqlite-vec code.
+
+## Architecture
+
+```
+app/              Wails binding layer — exported methods = frontend API
+internal/
+  agent/          LLM conversation loop, compression, sub-agents
+  agentcfg/       System prompts (system1.go) + context snapshots (system2.go)
+  mcp_tools/      30+ MCP tools the AI can call (read, edit, CRUD for all entities)
+  llm/            Multi-provider LLM transport (OpenAI-compatible)
+  session/        Sessions + messages (append-only, versioned for compression)
+  storage/        SQLite init + operation log + rollback
+  character/      Character CRUD + directed relationship graph
+  timeline/       Foreshadowing entries + 3-slot chapter plans (next/near/far)
+  storyarc/       Multi-node story arcs across chapters
+  reader/         Reader perspective tracking (known/suspense/misconception)
+  location/       Locations as graph: containment tree + undirected spatial edges
+  novel/          Novel metadata + global/per-novel preferences
+  chapter/        Chapter metadata (content stored as files in git repos)
+  git/            File I/O + git version control per novel
+  rag/            Vector search (sqlite-vec + ONNX bge-small-zh-v1.5 int8)
+  approval/       Blocking approval workflow (manual / auto modes)
+  config/         App config, settings, model directory resolution
+  platform/       OS-specific paths (AppDir, DataDir, ONNX lib resolution)
+  migrate/        Auto-migration
+  logger/         Structured slog logging
+frontend/         React 19 + TypeScript + Tailwind 4 + shadcn/ui
+```
+
+### Layering
+
+- `app/` is an adapter layer: translate Wails DTOs, call internal capabilities, and adapt errors. Do not put domain orchestration in exported App methods.
+- Simple, single-persistence CRUD may use `App → Store → DB`; do not add empty Service layers.
+- A Store owns queries, mutations, and transactional invariants for its persistence medium. For example, chapter group ordering (`volume_id` and `sort_order`) belongs in `chapter.Store`.
+- Cross-resource or cross-domain use cases must use `App → internal/<domain>.Service → Store/dependencies`. Services own business semantics, compensation, and coordination across DB records, Git files, references, vector indexes, and caches.
+- Internal Services must not depend on `app/` or Wails. Inject optional infrastructure through small interfaces or providers to avoid package cycles.
+
+## Key conventions
+
+- **Build tags**: All ONNX and sqlite-vec code uses `//go:build cgo` (see `internal/rag/`, `internal/mcp_tools/memory_tools.go`)
+- **Data dir**: `~/Goink/` on Linux/macOS, exe-adjacent on Windows. Contains `models/`, `runtime/`, `novel-agent.db`, `novels/`
+- **Per-novel git repos**: Each novel at `{DataDir}/novels/{id}/` with `chapters/NNN.md`, `outlines/NNN.md`, `goink.md`
+- **Preferences**: Global + per-novel, free-text category, LLM-classified
+- **Character relationships**: Append-only with `is_current` flag — updates create new rows, old rows become history
+- **Timeline entries**: `target_chapter` used for ORDER BY only, never WHERE (LLM estimates are imprecise)
+- **Messages**: Append-only, versioned for compression. Three query paths: to_api / to_frontend / full audit
+- **Commit style**: English, specific, no Co-Authored-By, no emoji
+- **Issue references in commit**: Use `Refs #NN` (or `refs #NN`, case-insensitive) at the END of commit message body, **never** `fixes #NN` / `closes #NN` / `resolves #NN`. GitHub auto-closes issues on those keywords, which has caused premature closure of multi-sub-issue reports (e.g. #32 was closed by a commit that only fixed one of three sub-problems). Unless the user **explicitly** says "close issue #NN in this commit", do not auto-close — let the user decide separately after verifying the fix is complete.
+- **Pre-commit hook**: `.githooks/pre-commit` auto-runs validation split by staged file scope — Go changes trigger `go build`/`go test`/`golangci-lint`, frontend changes trigger `npm run build`/`lint`/`test`, docs/config-only commits skip. No manual validation needed before commit.
+- **User communicates in Chinese** — respond in Chinese
+- **Edit tool + matching failure**: First attempt editing with `old_string` copied exactly from file content. If Edit fails repeatedly with "String to replace not found", then diagnose: `gofmt -w file.go` to normalize formatting, `cat -A` to check tab/space indentation, or widen `old_string` to include surrounding ASCII lines as anchors. Do NOT preemptively run gofmt/cat-A before the first attempt.
+- **Edit tool + same file**: When editing the same file multiple times, run Edits sequentially, never in parallel. Parallel Edits on the same file race — the later Edit writes based on the pre-edit version, silently overwriting the earlier Edit's change (observed: two Edits on rw_tools.go, the second reverted the first).
+
+## CGO / ONNX notes
+
+- ONNX embedder is a global singleton (`InitEmbedder` / `GetEmbedder`)
+- VectorStore is a global singleton (`InitVectorStore` / `GetVectorStore`)
+- RefreshQueue is a global singleton with `sync.Once` (`InitRefreshQueue` / `GetRefreshQueue`)
+- `ResolveOnnxLib()` search chain: `<appdir>/runtime/` → `~/Goink/runtime/` → system paths
+- Models resolution: `<appdir>/runtime/models/` → `~/Goink/models/`
+- Vec0 table per novel: `vec_novel_{id}`, cosine distance metric
+- Chunks: 420 tokens, 50 overlap, BERT WordPiece tokenizer
+- Embedding: 512-dim, CLS pooling + L2 normalization, BGE instruction prefix for queries only
+
+## No-gos
+
+- Never delete or modify logger statements or code comments without explicit request
+- Never modify code without user permission — ask first
+- Use Edit/Write tools only for code changes, never sed or python scripts
+- Don't proactively ask "commit?" or "start writing?" — wait for explicit instruction
+- Never hand-edit `frontend/src/lib/wailsjs/go/models.ts` — it is auto-generated by Wails bindings. Always regenerate via `wails generate module` or `make build` instead
+- Windows: `platform` build tag issues are expected — cgo code doesn't compile for Windows in diagnostics

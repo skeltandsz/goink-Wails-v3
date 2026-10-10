@@ -1,0 +1,69 @@
+# Binaries
+*.exe
+*.dll
+*.dylib
+spike_test
+
+# Test and dev
+dev_test/
+
+# ONNX model files (downloaded at runtime)
+models/
+
+# Build output
+/build/bin/
+/build/runtime/
+!/build/runtime/models/vocab.txt
+/build/dist/
+/build/*.AppDir/
+# Wails v3 产物目录：根 Taskfile.yml 的 BIN_DIR=bin（仓库根，取代 v2 的 build/bin）
+/bin/
+# generate:syso 的产物（构建后由 Taskfile 自行删除）
+*.syso
+# Windows 构建生成物。这里不能再用 `/build/windows/*` 整目录忽略：根 Taskfile.yml 的
+# includes.windows 指向 ./build/windows/Taskfile.yml，该文件缺失时 task 在解析阶段就报错，
+# 所有 wails3 build/package/task 调用（含 CI 的全新 clone）都会直接失败。
+# 需入库：Taskfile.yml、nsis/project.nsi（内含 Goink 的 runtime 捆绑逻辑）、info.json。
+# 由 wails3 生成、不入库：wails.exe.manifest 与 nsis/wails_tools.nsh
+# （wails3 task common:update:build-assets）、icon.ico（wails3 task common:generate:icons）。
+/build/windows/icon.ico
+/build/windows/wails.exe.manifest
+/build/windows/nsis/wails_tools.nsh
+goink
+goink.exe
+
+# Android：build/android（Gradle 工程 + android Taskfile）本身要入库，
+# 见 scripts/bootstrap-android-assets.sh；这里只忽略构建过程产物。
+build/android/**/build/
+build/android/.gradle/
+**/.gradle/
+# 机器相关的 SDK 路径，绝不能入库（会写死某台机器的 ANDROID_HOME）
+build/android/local.properties
+# overlay 由 `wails3 android overlay:gen` 每次构建生成
+build/android/overlay.json
+build/android/gen/
+*.apk
+*.aab
+
+# Go
+*.mod.cache
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+frontend/package.json.md5
+
+/release/
+docs.local/
+goink-skills/
+
+# Legacy Python prototype (Goink 前身，保留本地参考，不纳入版本控制)
+python-master/
