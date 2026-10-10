@@ -68,13 +68,21 @@ wails3 init \
   ${CFG_COMPANY:+-productcompany "$CFG_COMPANY"} \
   ${CFG_IDENTIFIER:+-productidentifier "$CFG_IDENTIFIER"}
 
-SRC="$TMP/proj/build/android"
-if [ ! -f "$SRC/Taskfile.yml" ]; then
-  echo "错误: 模板里没有找到 $SRC/Taskfile.yml，说明该版本 CLI 不提供 Android 脚手架" >&2
+# 不要写死 "$TMP/proj/build/android"：wails3 init 会把工程建在 -d 指定目录下的
+# 同名子目录里（-d "$TMP/proj" -n goink -> $TMP/proj/goink/build/android），
+# 而更早的布局是直接落在 -d 本身。写死一层会把"路径没对上"误报成
+# "该版本 CLI 不提供 Android 脚手架"（CI 上那次
+# "错误: 模板里没有找到 /tmp/tmp.XXXX/proj/build/android/Taskfile.yml" 即此，
+# 同一份日志的临时项目结构里明明有 proj/goink/build/android）。
+SRC="$(find "$TMP/proj" -maxdepth 4 -type d -path '*/build/android' 2>/dev/null | sort | head -1)"
+if [ -z "$SRC" ] || [ ! -f "$SRC/Taskfile.yml" ]; then
+  echo "错误: 临时项目里没有 build/android/Taskfile.yml，说明该版本 CLI 不提供 Android 脚手架" >&2
+  echo "查找根目录：$TMP/proj" >&2
   echo "临时项目结构：" >&2
-  find "$TMP/proj" -maxdepth 3 -type d | sed 's/^/  /' >&2
+  find "$TMP/proj" -maxdepth 4 -type d | sed 's/^/  /' >&2
   exit 1
 fi
+echo "脚手架源目录：$SRC"
 
 mkdir -p build
 cp -R "$SRC" build/android
