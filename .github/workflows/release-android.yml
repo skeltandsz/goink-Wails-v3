@@ -188,26 +188,70 @@ jobs:
           grep -E 'BundleConfig\.pb' "$RUNNER_TEMP/aab.txt" >/dev/null || { echo "::error::不是合法 AAB（缺 BundleConfig.pb）"; exit 1; }
 
           echo "=== 3. APK 元数据（包名 / versionName / versionCode）==="
-          APKANALYZER="$(ls "${ANDROID_HOME}"/cmdline-tools/*/bin/apkanalyzer 2>/dev/null | head -1 || true)"
-          if [ -n "$APKANALYZER" ]; then
-            BADGE="$("$APKANALYZER" apk badging "$APK" | tee "$RUNNER_TEMP/badging.txt" || true)"
-            echo "$BADGE" | grep -q "package: name='${EXPECTED_APP_ID}'" \
-              || { echo "::error::包名不是 ${EXPECTED_APP_ID}：$(echo "$BADGE" | grep -m1 '^package:' || echo 无)"; exit 1; }
-            echo "$BADGE" | grep -q "versionCode='${VERSION_CODE}'" \
+          # 工具差异是这里的坑：cmdline-tools 16 的 apkanalyzer 已经没有 `apk badging`
+          # verb（只剩 summary/file-size/download-size/features/compare），调用它只会
+          # 打出 usage 文本，原来的断言于是拿着 usage 去找 package: name= 而报
+          # “包名不是 com.sigpanic.goink：无”。所以：
+          #   主路径 aapt2/aapt dump badging —— 经典格式，package/versionCode/versionName
+          #   三个字段名十几年没变；
+          #   兜底 —— 直接读 APK 里 AndroidManifest 的字符串池（unzip+tr，不依赖 SDK
+          #   分析工具），能断言包名和 versionName；versionCode 是 AXML 头里的整型字段，
+          #   字符串池里没有，只能降级成 warning。
+          AAPT2="$(ls "${ANDROID_HOME}"/build-tools/*/aapt2 2>/dev/null | sort -V | tail -1 || true)"
+          AAPT="$(ls "${ANDROID_HOME}"/build-tools/*/aapt 2>/dev/null | sort -V | tail -1 || true)"
+          APKSIGNER="$(ls "${ANDROID_HOME}"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -1 || true)"
+
+          BADGE=""
+          for TOOL in "${AAPT2}" "${AAPT}"; do
+            [ -n "${TOOL}" ] || continue
+            BADGE="$("${TOOL}" dump badging "${APK}" 2>/dev/null || true)"
+            if printf '%s\n' "${BADGE}" | grep -q "^package: name="; then
+              echo "badging 工具：${TOOL}"
+              break
+            fi
+            BADGE=""
+          done
+
+          if [ -n "${BADGE}" ]; then
+            printf '%s\n' "${BADGE}" > "$RUNNER_TEMP/badging.txt"
+            grep -q "^package: name='${EXPECTED_APP_ID}'" "$RUNNER_TEMP/badging.txt" \
+              || { echo "::error::包名不是 ${EXPECTED_APP_ID}：$(grep -m1 '^package:' "$RUNNER_TEMP/badging.txt" || echo 无)"; exit 1; }
+            grep -q "versionCode='${VERSION_CODE}'" "$RUNNER_TEMP/badging.txt" \
               || { echo "::error::versionCode 与期望的 ${VERSION_CODE} 不符（build.gradle 未被正确写入）"; exit 1; }
-            echo "$BADGE" | grep -q "versionName='${VERSION_CORE}'" \
+            grep -q "versionName='${VERSION_CORE}'" "$RUNNER_TEMP/badging.txt" \
               || { echo "::error::versionName 与期望的 ${VERSION_CORE} 不符"; exit 1; }
             echo "包名/版本校验通过：${EXPECTED_APP_ID} ${VERSION_CORE} (code ${VERSION_CODE})"
-
-            echo "=== 4. 签名身份 ==="
-            "$APKANALYZER" apk signing-block "$APK" >/dev/null 2>&1 || true
-            if command -v apksigner >/dev/null 2>&1; then
-              apksigner verify --print-certs "$APK" | head -8 || echo "::warning::apksigner 校验失败"
-            fi
           else
-            echo "::warning::未找到 apkanalyzer，跳过包名/版本断言"
-            unzip -l "$APK" | grep -E 'lib/(arm64-v8a|x86_64)/libwails\.so' || { echo "::error::APK 缺 native 库"; exit 1; }
+            echo "::warning::aapt2/aapt 都不可用，改用 AndroidManifest 字符串池校验（不含 versionCode）"
+            # AXML 的字符串池是 UTF-16LE，先删掉 NUL 才能得到连续的 ASCII，
+            # 再把所有非可打印字节换成换行，字符串就各占一行。
+            MANIFEST_STRINGS="$(unzip -p "${APK}" AndroidManifest.xml | tr -d '\000' | tr -c '[:print:]' '\n' || true)"
+            # 字符串池里包名/versionName 各是独立条目，但相邻条目之间的长度头偶尔落在
+            # 可打印字节上，可能被拼进同一行，所以按"非标识符字符"取边界，而不是整行相等。
+            printf '%s\n' "${MANIFEST_STRINGS}" \
+              | grep -qE "(^|[^A-Za-z0-9_.])${EXPECTED_APP_ID//./\\.}([^A-Za-z0-9_.]|\$)" \
+              || { echo "::error::AndroidManifest 里找不到包名 ${EXPECTED_APP_ID}"; exit 1; }
+            printf '%s\n' "${MANIFEST_STRINGS}" \
+              | grep -qE "(^|[^0-9.])${VERSION_CORE//./\\.}([^0-9.]|\$)" \
+              || { echo "::error::AndroidManifest 里找不到 versionName ${VERSION_CORE}"; exit 1; }
+            echo "包名/版本校验通过（宽松路径）：${EXPECTED_APP_ID} ${VERSION_CORE}"
           fi
+
+          echo "=== 4. 签名身份 ==="
+          # apksigner 不在 PATH 上（setup-android 只把 cmdline-tools 加进去），
+          # 必须按 build-tools 目录找，否则这段校验一直是静默跳过的。
+          if [ -n "${APKSIGNER}" ]; then
+            "${APKSIGNER}" verify --print-certs "${APK}" | head -8 \
+              || echo "::warning::apksigner 校验失败（产物可能没签名）"
+          elif command -v apksigner >/dev/null 2>&1; then
+            apksigner verify --print-certs "${APK}" | head -8 \
+              || echo "::warning::apksigner 校验失败（产物可能没签名）"
+          else
+            echo "::warning::未找到 apksigner，跳过签名校验"
+          fi
+
+          unzip -l "${APK}" | grep -E 'lib/(arm64-v8a|x86_64)/libwails\.so' \
+            || { echo "::error::APK 缺 native 库"; exit 1; }
 
           echo "=== 5. 前端产物已随 Go 二进制嵌入 ==="
           # 移动端 assets 由 go:embed 打进 libwails.so，再由 WebViewAssetLoader 提供，
