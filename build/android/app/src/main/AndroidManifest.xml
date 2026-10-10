@@ -15,6 +15,40 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
 
+    <!-- ==================== 新增：文件/媒体读写、后台保活、日历 ====================
+         运行时报错只对这些权限弹框；每条都按 API level 收窄，避免申请一个系统根本
+         不会授予的权限（Play 审核会把"声明了但用不到/申请不合理"当成拒收理由）。
+         提审前每一类都要有真实调用点：申请统一走 Permissions.ensure(CAP_*)，
+         非弹框门禁（电池白名单 / 精确闹钟）走 Permissions#requestBatteryExemption、
+         #requestExactAlarmAccess。 -->
+
+    <!-- 相册/图片读取：33+ 必须用细分的 READ_MEDIA_*；≤32 没有 READ_MEDIA_*，
+         只能申请 READ_EXTERNAL_STORAGE，所以用 maxSdkVersion 把老权限卡在第 32 级。
+         故意不声明 READ_MEDIA_VIDEO / _AUDIO：Play 要求"声明即使用"，用不到就别报。 -->
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+    <!-- 共享目录的"写"在 29 起就被 scoped storage 取代（走 SAF / MediaStore），
+         WRITE_EXTERNAL_STORAGE 只对 ≤28 有效，声明更晚会直接被系统忽略。
+         这里故意不声明 MANAGE_EXTERNAL_STORAGE（所有文件访问）：它要求 Play Console
+         单独审批，而 goink 在 Android 上的章节仓库落在应用私有目录里，用不到它。 -->
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28" />
+
+    <!-- 日历：写作计划 / 截止日提醒要读写 CalendarContract。 -->
+    <uses-permission android:name="android.permission.READ_CALENDAR" />
+    <uses-permission android:name="android.permission.WRITE_CALENDAR" />
+
+    <!-- 后台保活：自动保存与 RefreshQueue 不能被 Doze 掐断。
+         WAKE_LOCK 是 normal 权限（装上即授予，不弹框）；电池白名单不是运行时权限，
+         只能跳系统设置页让用户确认，见 Permissions#requestBatteryExemption。 -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- 精确提醒：31+ 需在 Play Console 声明用途，33+ 用户可在系统设置里撤销，
+         所以判定要看 AlarmManager#canScheduleExactAlarms() 而不是只看已授予。
+         USE_EXACT_ALARM 只允许闹钟/日历类应用使用，这里故意不声明。 -->
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+
     <queries>
         <intent>
             <action android:name="android.media.action.IMAGE_CAPTURE" />

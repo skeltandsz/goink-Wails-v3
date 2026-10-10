@@ -711,35 +711,99 @@ public class WailsBridge {
     public void postNotification(final String json) {
         mainHandler.post(() -> {
             try {
-                JSONObject opts = new JSONObject(json);
-                String title = opts.optString("title", "Notification");
-                String body = opts.optString("body", "");
-                String channelId = "wails_default";
-                NotificationManager nm =
-                        (NotificationManager) activity.getSystemService(Context.NOTIFICATION_SERVICE);
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    NotificationChannel ch = new NotificationChannel(
-                            channelId, "General", NotificationManager.IMPORTANCE_DEFAULT);
-                    nm.createNotificationChannel(ch);
+                Permissions gate = permissionGate();
+                if (gate == null) {
+                    // No gate means the host activity is not MainActivity; fall back to
+                    // posting unconditionally rather than dropping the notification.
+                    doPostNotification(json);
+                    return;
                 }
-                if (Build.VERSION.SDK_INT >= 33 && activity.checkSelfPermission(
-                        "android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED) {
-                    activity.requestPermissions(
-                            new String[]{"android.permission.POST_NOTIFICATIONS"}, 1001);
-                }
-                Notification n = new NotificationCompat.Builder(activity, channelId)
-                        .setSmallIcon(android.R.drawable.ic_dialog_info)
-                        .setContentTitle(title)
-                        .setContentText(body)
-                        .setAutoCancel(true)
-                        .build();
-                nm.notify((int) (System.currentTimeMillis() & 0x0fffffff), n);
-                emitEvent("common:notification", "{\"ok\":true}");
+                // Deliberately do not post before the grant: on 13+ a notification
+                // created while the permission is missing is silently swallowed, and the
+                // caller already got {"ok":true} from us — a lie we cannot take back.
+                gate.ensure(Permissions.CAP_NOTIFICATIONS, (capability, granted, permanent, reason) -> {
+                    if (granted) {
+                        doPostNotification(json);
+                    } else {
+                        emitEvent("common:notification",
+                                "{\"ok\":false,\"error\":\"notification permission denied\","
+                                        + "\"permanentlyDenied\":" + permanent + "}");
+                    }
+                });
             } catch (Exception e) {
                 Log.e(TAG, "postNotification failed", e);
                 emitEvent("common:notification", "{\"ok\":false}");
             }
         });
+    }
+
+    /** Builds and posts the notification; permission state is the caller's business. */
+    private void doPostNotification(final String json) {
+        try {
+            JSONObject opts = new JSONObject(json);
+            String title = opts.optString("title", "Notification");
+            String body = opts.optString("body", "");
+            String channelId = "wails_default";
+            NotificationManager nm =
+                    (NotificationManager) activity.getSystemService(Context.NOTIFICATION_SERVICE);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                NotificationChannel ch = new NotificationChannel(
+                        channelId, "General", NotificationManager.IMPORTANCE_DEFAULT);
+                nm.createNotificationChannel(ch);
+            }
+            Notification n = new NotificationCompat.Builder(activity, channelId)
+                    .setSmallIcon(android.R.drawable.ic_dialog_info)
+                    .setContentTitle(title)
+                    .setContentText(body)
+                    .setAutoCancel(true)
+                    .build();
+            nm.notify((int) (System.currentTimeMillis() & 0x0fffffff), n);
+            emitEvent("common:notification", "{\"ok\":true}");
+        } catch (Exception e) {
+            Log.e(TAG, "postNotification failed", e);
+            emitEvent("common:notification", "{\"ok\":false}");
+        }
+    }
+
+    /**
+     * Ask for a capability's runtime permissions from Java. json: {"capability",
+     * "openSettings"}. Result is reported as the "wails:permission" event emitted by
+     * Permissions ({"capability","granted","permanentlyDenied","reason"}).
+     *
+     * Capabilities, not permission names, are the contract: what a capability maps
+     * to depends on the API level (media = READ_MEDIA_IMAGES on 33+,
+     * READ_EXTERNAL_STORAGE below; storageWrite has no grantable permission on 29+
+     * and answers with reason "scoped-storage", so callers must use SAF/MediaStore
+     * instead — see Permissions#persistTreeGrant / #hasPersistedTreeAccess).
+     *
+     * openSettings=true skips straight to the app's Settings page, which is what a
+     * permanently denied capability needs: requestPermissions() is then a no-op that
+     * silently returns "denied" forever.
+     */
+    public void requestCapability(final String json) {
+        mainHandler.post(() -> {
+            Permissions gate = permissionGate();
+            if (gate == null) {
+                emitEvent(Permissions.EVENT, "{\"granted\":false,\"reason\":\"no-gate\"}");
+                return;
+            }
+            try {
+                JSONObject o = new JSONObject(json);
+                String capability = o.optString("capability", "");
+                if (o.optBoolean("openSettings", false)) {
+                    gate.openAppSettings();
+                }
+                gate.ensure(capability, null);
+            } catch (Exception e) {
+                Log.e(TAG, "requestCapability failed", e);
+                emitEvent(Permissions.EVENT, "{\"granted\":false,\"reason\":\"bad-payload\"}");
+            }
+        });
+    }
+
+    /** The activity's permission gate; null when the host is not MainActivity. */
+    private Permissions permissionGate() {
+        return activity instanceof MainActivity ? ((MainActivity) activity).permissions() : null;
     }
 
     /**
@@ -1245,20 +1309,66 @@ public class WailsBridge {
                     text = o.optString("text", text);
                 } catch (Exception ignored) {
                 }
-                if (Build.VERSION.SDK_INT >= 33 && activity.checkSelfPermission(
-                        "android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED) {
-                    activity.requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 1003);
+                Permissions gate = permissionGate();
+                if (gate != null) {
+                    // Fire-and-forget: a foreground service is allowed to run with its
+                    // notification suppressed when POST_NOTIFICATIONS is still missing,
+                    // so starting must not wait on the dialog. The grant arrives through
+                    // the "wails:permission" event and the notification shows up on the
+                    // next startForeground().
+                    gate.ensure(Permissions.CAP_NOTIFICATIONS, null);
                 }
                 Intent i = new Intent(activity, WailsForegroundService.class);
                 i.setAction(WailsForegroundService.ACTION_START);
                 i.putExtra("title", title);
                 i.putExtra("text", text);
                 ContextCompat.startForegroundService(activity, i);
-                emitEvent("android:foregroundService", "{\"running\":true}");
+                // batteryExempt / exactAlarms are the two Settings-screen gates behind
+                // "keeps running + reminds on time": report them so the frontend can
+                // offer the prompt instead of silently being killed by Doze.
+                boolean batteryExempt = gate == null || gate.isBatteryExempt();
+                boolean exactAlarms = gate == null || gate.canScheduleExactAlarms();
+                emitEvent("android:foregroundService",
+                        "{\"running\":true,\"batteryExempt\":" + batteryExempt
+                                + ",\"exactAlarms\":" + exactAlarms + "}");
             } catch (Exception e) {
                 Log.e(TAG, "startForegroundService failed", e);
                 emitEvent("android:foregroundService", "{\"running\":false,\"error\":\"failed to start\"}");
             }
+        });
+    }
+
+    /**
+     * Open the system prompt that exempts this app from battery optimisation. Not a
+     * runtime permission: the user lands on a Settings screen and can refuse there,
+     * so this only reports what was shown, never a granted state.
+     * Event: "android:power" {"batteryExempt","promptShown"}.
+     */
+    public void requestBatteryExemption() {
+        mainHandler.post(() -> {
+            Permissions gate = permissionGate();
+            boolean opened = gate != null && gate.requestBatteryExemption();
+            emitEvent("android:power",
+                    "{\"batteryExempt\":" + (gate != null && gate.isBatteryExempt())
+                            + ",\"promptShown\":" + opened + "}");
+        });
+    }
+
+    /**
+     * Open the system's exact-alarm settings for this app (API 31+; a no-op below
+     * that, where the permission is unconditional). The reminder path must call
+     * this before AlarmManager#setExactAndAllowWhileIdle, which otherwise throws
+     * SecurityException on 31+ once the user has revoked it.
+     * Event: "android:power" {"capability":"reminders","granted","promptShown"}.
+     */
+    public void requestExactAlarmAccess() {
+        mainHandler.post(() -> {
+            Permissions gate = permissionGate();
+            boolean opened = gate != null && gate.requestExactAlarmAccess();
+            emitEvent("android:power",
+                    "{\"capability\":\"reminders\",\"granted\":"
+                            + (gate != null && gate.canScheduleExactAlarms())
+                            + ",\"promptShown\":" + opened + "}");
         });
     }
 

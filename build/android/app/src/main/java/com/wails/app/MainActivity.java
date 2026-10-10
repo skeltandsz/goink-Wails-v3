@@ -57,6 +57,10 @@ public class MainActivity extends AppCompatActivity {
 
     private WebView webView;
     private WailsBridge bridge;
+    // Capability-scoped runtime-permission gate. Named permissionGate rather than
+    // `permissions` because onRequestPermissionsResult()'s parameter of that name
+    // would shadow the field.
+    private Permissions permissionGate;
     // Battery: system-event receivers are registered only while the activity is
     // in the foreground (onStart) and torn down in onStop, so background battery/
     // network/screen broadcasts don't wake the app.
@@ -88,12 +92,24 @@ public class MainActivity extends AppCompatActivity {
         // Initialize the native Go library
         bridge = new WailsBridge(this);
         bridge.initialize();
+        // Gate must exist before the WebView can call anything: it owns the 7100+
+        // request-code block and WailsBridge capabilities resolve through it.
+        permissionGate = new Permissions(this, bridge);
 
         // Set up WebView
         setupWebView();
 
         // Load the application
         loadApplication();
+    }
+
+    /**
+     * Runtime-permission gate for the capabilities in WailsBridge. Package-private
+     * on purpose: only the scaffold's own Java code may ask, never the WebView (JS
+     * has no permission API here; window.wails only sees WailsJSBridge's methods).
+     */
+    Permissions permissions() {
+        return permissionGate;
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -240,6 +256,12 @@ public class MainActivity extends AppCompatActivity {
     @Override
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        // 7100+ block belongs to Permissions; it must see the result first, or the
+        // capability callbacks below would swallow it as an unknown code.
+        if (permissionGate != null
+                && permissionGate.handleResult(requestCode, permissions, grantResults)) {
+            return;
+        }
         if (requestCode == CAMERA_PERMISSION_REQUEST) {
             if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
                 launchCameraCapture(pendingCaptureIsVideo);
