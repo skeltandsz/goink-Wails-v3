@@ -5,7 +5,7 @@ export default function LoadingScreen() {
   const { t } = useTranslation();
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-background">
+    <div className="flex min-h-dvh items-center justify-center bg-background">
       <p className="text-muted-foreground">{t("app.loading")}</p>
     </div>
   );

@@ -117,7 +117,7 @@ export default function InitView({ error: startupError }: Props) {
   }
 
   return (
-    <div className="flex items-center justify-center min-h-screen">
+    <div className="flex items-center justify-center min-h-dvh">
       <div className="w-full max-w-lg mx-auto px-8 py-12 text-center">
         <Logo className="h-16 w-16 mx-auto mb-8" />
 

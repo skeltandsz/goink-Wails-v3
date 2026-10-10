@@ -20,7 +20,7 @@ export default function StartupOverlay({
   const failed = phase === "failed";
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-background px-6">
+    <div className="flex min-h-dvh items-center justify-center bg-background px-6">
       <div className="w-full max-w-md rounded-xl border bg-card p-8 text-center shadow-sm">
         <Logo className="mx-auto mb-6 h-14 w-14" />
         {failed ? (

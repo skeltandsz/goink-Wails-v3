@@ -3,7 +3,18 @@
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- 移动端（Android WebView）参数：
+         - viewport-fit=cover：内容延伸到刘海/挖孔区域，配合 index.css 的
+           --safe-area-inset-* 变量自己留白，否则横屏时 notch 会盖住左侧工具栏。
+         - maximum-scale=1 + user-scalable=no：这个界面是按桌面三栏工作台设计的，
+           布局用 fixed 高度与 flex 填满，WebView 的手势缩放会让缩放后的视口与
+           100dvh 计算脱节（表现为缩放后底部被裁、抽屉定位漂移）。代价是放弃
+           浏览器级捏合缩放，可读性依赖应用内字号，这是有意的取舍。
+         桌面平台这段 meta 无副作用（Electron/浏览器按 width=device-width 正常渲染）。 -->
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
+    />
     <title>goink-frontend</title>
   </head>
   <script>

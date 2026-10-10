@@ -67,10 +67,16 @@
         android:theme="@style/Theme.WailsApp"
         tools:targetApi="31">
 
+        <!-- sensorLandscape 而不是 landscape：写作场景常见外接键盘/支架，
+             两个横屏方向都要能用。configChanges 必须补齐 smallestScreenSize|
+             screenLayout|density：只声明 orientation|screenSize 时，旋转到另一个
+             横屏方向或切换显示大小仍会重建 Activity，而 WebView 一重建就丢掉 Go 侧
+             已加载的页面与前端状态（表现为转屏白屏一下）。 -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:configChanges="orientation|screenSize|keyboardHidden|uiMode"
+            android:screenOrientation="sensorLandscape"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|density|keyboardHidden|uiMode"
             android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
