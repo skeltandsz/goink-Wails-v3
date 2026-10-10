@@ -514,6 +514,56 @@ func TestParity_RevertRename(t *testing.T) {
 	}
 }
 
+// TestParity_BinaryFileStats 锁住二进制文件（封面 jpg）的 numstat 语义：
+// git CLI 对二进制输出 "-\t-\tpath"，parseDetailedLog 解析后增删行数都是 0，
+// 但文件仍算一个变更文件。go-git 后端必须给同样的结果，否则手机上提交一次封面，
+// 历史列表就会显示"+123456 / -123456 行"这种荒谬数字。
+func TestParity_BinaryFileStats(t *testing.T) {
+	for _, kind := range parityBackends {
+		t.Run(kind, func(t *testing.T) {
+			r, dir := newParityRepo(t, kind)
+
+			binary := []byte{0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x00, 0x01, 0x02, 0x03, 0x00, 0x00, 0xff, 0xd9}
+			if err := os.WriteFile(filepath.Join(dir, "cover.jpg"), binary, 0o644); err != nil {
+				t.Fatalf("write cover: %v", err)
+			}
+			h := commitAll(t, r, "add cover")
+
+			logs, err := r.LogDetailed(10, "")
+			if err != nil {
+				t.Fatalf("LogDetailed: %v", err)
+			}
+			if logs[0].Hash != h {
+				t.Fatalf("最新历史不是刚提交的 %q", h)
+			}
+			if logs[0].FilesChanged != 1 {
+				t.Errorf("FilesChanged = %d，期望 1（二进制仍算一个变更文件）", logs[0].FilesChanged)
+			}
+			if logs[0].Insertions != 0 || logs[0].Deletions != 0 {
+				t.Errorf("二进制文件行数统计 = +%d/-%d，期望 +0/-0（与 git 的 -\\t- 一致）",
+					logs[0].Insertions, logs[0].Deletions)
+			}
+
+			// 覆盖一次"改封面"：内容变化要仍算 1 个文件、0 行
+			if err := os.WriteFile(filepath.Join(dir, "cover.jpg"), append(binary, 0x00, 0x01), 0o644); err != nil {
+				t.Fatalf("rewrite cover: %v", err)
+			}
+			h2 := commitAll(t, r, "replace cover")
+			logs, err = r.LogDetailed(10, "")
+			if err != nil {
+				t.Fatalf("LogDetailed: %v", err)
+			}
+			if logs[0].Hash != h2 || logs[0].FilesChanged != 1 {
+				t.Errorf("换封面后的历史 = %+v，期望 FilesChanged 1", logs[0])
+			}
+			if logs[0].Insertions != 0 || logs[0].Deletions != 0 {
+				t.Errorf("换封面的行数统计 = +%d/-%d，期望 +0/-0",
+					logs[0].Insertions, logs[0].Deletions)
+			}
+		})
+	}
+}
+
 func TestParity_SetGitConfigChangesAuthor(t *testing.T) {
 	for _, kind := range parityBackends {
 		t.Run(kind, func(t *testing.T) {

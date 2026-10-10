@@ -381,16 +381,16 @@ func (g *goGitBackend) logDetailed(n int, afterHash string) ([]CommitInfo, error
 			AuthorName:  c.Author.Name,
 			AuthorEmail: c.Author.Email,
 		}
-		// Stats 相对首父，等价 --numstat（含 rename 时的双侧路径由 Name 给出）
-		stats, err := c.Stats()
+		// 统计自己算，不用 object.Commit.Stats()：go-git 的 Stats 基于文本 patch，
+		// 二进制文件（封面 jpg）会被整个跳过，导致 FilesChanged 少算 —— 与 CLI 的
+		// "-\t-\tpath"（算一个文件、0 行）不一致。见 commitStats。
+		files, ins, del, err := g.commitStats(c)
 		if err != nil {
 			return err
 		}
-		info.FilesChanged = len(stats)
-		for _, s := range stats {
-			info.Insertions += s.Addition
-			info.Deletions += s.Deletion
-		}
+		info.FilesChanged = files
+		info.Insertions = ins
+		info.Deletions = del
 		out = append(out, info)
 		if n > 0 && len(out) >= n {
 			return storer.ErrStop
@@ -449,6 +449,76 @@ func (g *goGitBackend) fileEntries(c *object.Commit) ([]FileEntry, error) {
 		}
 	}
 	return entries, nil
+}
+
+// commitStats 返回 commit 相对首父的 (变更文件数, 新增行, 删除行)，对齐 `git log --numstat`。
+//
+// 为什么不直接用 go-git 的 Commit.Stats()：它建立在文本 patch 上，二进制文件不产生
+// patch，于是"只改了一次封面"在历史里显示成 0 个变更文件；CLI 则输出
+// "-\t-\tcover.jpg"，即 1 个文件、0 行。这里按 CLI 的语义来。
+// rename 与 CLI 一致：按旧内容与新内容比行数（纯改名就是 0/0）。
+func (g *goGitBackend) commitStats(c *object.Commit) (files, added, deleted int, err error) {
+	entries, err := g.fileEntries(c)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	p, err := parentCommit(c)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	parentTree, err := treeOf(p)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	commitTree, err := treeOf(c)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+
+	for _, e := range entries {
+		files++
+		oldPath := e.Path
+		if e.OldPath != "" {
+			oldPath = e.OldPath
+		}
+		before, err := g.blobAt(parentTree, oldPath)
+		if err != nil {
+			return 0, 0, 0, err
+		}
+		after, err := g.blobAt(commitTree, e.Path)
+		if err != nil {
+			return 0, 0, 0, err
+		}
+		a, d := countLineDiff(before, after)
+		added += a
+		deleted += d
+	}
+	return files, added, deleted, nil
+}
+
+// countLineDiff 数出 before → after 的增删行数；任一侧是二进制就按 0/0（同 git）。
+func countLineDiff(before, after []byte) (added, deleted int) {
+	if isBinaryContent(before) || isBinaryContent(after) {
+		return 0, 0
+	}
+	for _, ln := range diffLines(string(before), string(after)) {
+		switch ln.op {
+		case '+':
+			added++
+		case '-':
+			deleted++
+		}
+	}
+	return added, deleted
+}
+
+// isBinaryContent 采用 git 的判据：前 8000 字节内出现 NUL 即视为二进制。
+func isBinaryContent(b []byte) bool {
+	limit := len(b)
+	if limit > 8000 {
+		limit = 8000
+	}
+	return bytes.IndexByte(b[:limit], 0) >= 0
 }
 
 func (g *goGitBackend) commitFileList(hash string) (*CommitInfo, []FileEntry, error) {
@@ -553,6 +623,11 @@ func (g *goGitBackend) showFile(hash, filePath string) (*FileDiff, error) {
 // ── revert ────────────────────────────────────────────────
 
 // revertNoCommit 逆序 revert 所有 hash，仅暂存不提交。任一步失败时整体回滚。
+//
+// 这里刻意不做"工作区必须整体干净"的前置守卫：git CLI 的 `revert --no-commit` 只在
+// revert 真正会覆盖到某个已跟踪文件时才拒绝，未跟踪文件与无关路径的改动都放行
+// （Goink 的封面、导出物常常还没进 git）。下面按路径做内容比对已经覆盖了"会动到
+// 的文件不允许有未提交改动"这一半语义，整体守卫反而会让回滚在常见场景下失败。
 func (g *goGitBackend) revertNoCommit(hashes []string) error {
 	for i := len(hashes) - 1; i >= 0; i-- {
 		if err := g.revertOne(hashes[i]); err != nil {
