@@ -2,6 +2,7 @@ package main
 
 import (
 	"embed"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -25,12 +26,28 @@ import (
 var assets embed.FS
 
 func main() {
+	// Android 上 $HOME=/sdcard 不可写，必须在碰到任何路径之前换成应用专属目录，
+	// 且必须早于 logger.Default()（它会往 DataDir 写 goink.log）与 ONNX/DataDir
+	// 解析。失败只写 stderr —— 此时项目 logger 还没起来 —— 然后继续按原逻辑跑，
+	// 让后面 "创建配置目录失败" 带着真实原因暴露，而不是在这里静默改路径。
+	// 非 Android 平台是空操作（见 internal/platform/home_*.go）。
+	if err := platform.EnsureWritableHome(); err != nil {
+		fmt.Fprintln(os.Stderr, "警告: 未能切换到可写的用户目录:", err)
+	}
+
 	log := logger.Default()
 	// 将项目 logger 注册为 slog 全局默认：让未注入 logger 的代码（agentcfg 包级 slog.Warn、
 	// git/skill/update 包的 nil-fallback 等）也走项目 logger 配置（写 goink.log + stderr、
 	// AddSource=true、Debug 级）。生产路径仍以依赖注入为主（App/Agent/MCP 工具显式拿 logger），
 	// SetDefault 作为漏注入代码的兜底。紧接 logger.Default() 后调用，时序最干净。
 	slog.SetDefault(log)
+
+	// 设备上没法直接翻目录树，把真正落地的 HOME 与 DataDir 记进日志：这是 adb
+	// logcat 里判断"数据/配置到底写在哪"的唯一线索（本次 /sdcard/.goink 的错就是
+	// 少了这条才要靠报错信息反推）。桌面平台不记，避免给正常启动加噪音。
+	if runtime.GOOS == "android" {
+		log.Info("Android 用户目录", "HOME", os.Getenv("HOME"), "dataDir", platform.DataDir())
+	}
 
 	if lib, err := platform.ResolveOnnxLib(); err == nil {
 		ort.SetSharedLibraryPath(lib)
