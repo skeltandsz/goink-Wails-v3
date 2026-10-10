@@ -11,7 +11,7 @@ inputs:
     required: false
     default: ''
   gui-deps:
-    description: '是否安装桌面 GUI/CGO 系统依赖（GTK/WebKit/sqlite 头文件）。Android 走 NDK 交叉编译，不需要，设 false 可省 1-2 分钟'
+    description: '是否安装桌面 App 的 GUI/CGO 系统依赖（GTK3 + WebKit2GTK 4.1 + sqlite 头文件）。Android 走 NDK 交叉编译，不需要，设 false 可省 1-2 分钟。注意：编译 wails3 CLI 自身用的 GTK4/WebKitGTK-6.0 头文件不受这个开关控制，Linux 上总是装（否则 go install CLI 编不过）'
     required: false
     default: 'true'
   runtime-deps:
@@ -45,6 +45,29 @@ runs:
         node-version: '24'
         cache: 'npm'
         cache-dependency-path: frontend/package-lock.json
+
+    # wails3 CLI 自己的依赖图里带了 cgo 源文件：beta.28 的
+    # v3/internal/operatingsystem/webkit_linux.go 是
+    #   //go:build linux && cgo && !gtk3 && !android
+    #   #cgo linux pkg-config: gtk4 webkitgtk-6.0
+    # 而 cmd/wails3 经 internal/doctor、internal/setupwizard、internal/commands
+    # 都会链到这个包。Linux runner 默认 CGO_ENABLED=1 且不带 GTK 开发包，于是
+    # `go install cmd/wails3` 自己就编不过：
+    # "Package gtk4 was not found in the pkg-config search path"。
+    # 必须在下面那步之前装：装晚了没用，CLI 已经在编译了；也不能靠 gui-deps
+    # —— 那步装的是 App 用的 GTK3 + WebKit2GTK 4.1（本项目走 -tags gtk3），
+    # 与 CLI 需要的 gtk4 / webkitgtk-6.0 不是一套 pkg-config 名字。
+    # Android job 同理：它不需要桌面 GUI 依赖（gui-deps=false），但仍然要这几个
+    # 头文件才能把 CLI 编出来。
+    - name: Install GTK4 / WebKitGTK-6.0 headers (wails3 CLI build only)
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        set -euo pipefail
+        sudo apt-get update
+        sudo apt-get install -y libgtk-4-dev libwebkitgtk-6.0-dev
+        echo "pkg-config 探测："
+        pkg-config --modversion gtk4 webkitgtk-6.0
 
     - name: Install wails3 CLI pinned to go.mod
       id: toolchain

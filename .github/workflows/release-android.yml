@@ -63,36 +63,24 @@ env:
 jobs:
   build-android:
     runs-on: ubuntu-latest
+    # workflow 级是 contents: read（构建本身只需要读代码），但最后那步
+    # Attach to GitHub Release 要建/改 release，read-only token 会 403：
+    # "Resource not accessible by integration"。这里给 job 开 contents: write，
+    # 而不是把发布拆成独立 job —— 产物就在 runner 工作区里，拆出去还得
+    # download-artifact 绕一圈。Play 上传走服务账号 JSON，不吃 GITHUB_TOKEN。
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
-      # wails3 CLI 自己的依赖图里带了 cgo 源文件：beta.28 的
-      # v3/internal/operatingsystem/webkit_linux.go 是
-      #   //go:build linux && cgo && !gtk3 && !android
-      #   #cgo linux pkg-config: gtk4 webkitgtk-6.0
-      # 而 cmd/wails3 经 internal/doctor、internal/setupwizard、internal/commands
-      # 都会链到这个包。ubuntu runner 默认 CGO_ENABLED=1，于是 `go install cmd/wails3`
-      # 需要系统里有 GTK4 + WebKitGTK 6.0 的开发头文件，缺了就在装完 Go/Node 之后
-      # 立刻报 "Package gtk4 was not found in the pkg-config search path"（run 102993449283）。
-      # 这一步只服务 CLI 的编译期，与 App 无关：Android App 用 NDK 交叉编译，
-      # GOOS=android 会排除上面这些 cgo 文件，所以下面 wails3-setup 的 gui-deps 仍保持
-      # false。头文件必须在这里先装：wails3-setup 内部是先 go install CLI、后装平台依赖，
-      # 顺序上它自己解决不了（而且它装的是 App 用的 GTK3/WebKit2GTK 4.1，不是 CLI 要的
-      # gtk4/webkitgtk-6.0）。
-      - name: Install GTK4 / WebKitGTK-6.0 headers (wails3 CLI build only)
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y libgtk-4-dev libwebkitgtk-6.0-dev
-          echo "pkg-config 探测："
-          pkg-config --modversion gtk4 webkitgtk-6.0
-
-      # 只借它装 Go/Node/wails3、推导版本号、同步 build/config.yml；
-      # Android 用 NDK clang 交叉编译，不需要 GTK/sqlite 头，也不需要
-      # build/runtime（MinGit 与 onnxruntime 在 Android 上没有对应形态）。
+      # 只借它装 Go/Node/wails3、推导版本号、同步 build/config.yml。
+      # wails3-setup 在 Linux 上会先装 GTK4/WebKitGTK-6.0 头文件再 go install CLI
+      # （CLI 自己的依赖图里有 `#cgo pkg-config: gtk4 webkitgtk-6.0` 的 cgo 文件，
+      # 缺了 CLI 就编不过），这与 App 无关；App 侧的桌面 GUI 依赖和 build/runtime
+      # 仍然不需要（Android 走 NDK 交叉编译，MinGit 与 onnxruntime 在 Android 上
+      # 没有对应形态），所以 gui-deps / runtime-deps 保持 false。
       - name: Prepare Wails toolchain
         id: goink_env
         uses: ./.github/actions/wails3-setup
@@ -112,17 +100,9 @@ jobs:
           build-tools: ${{ env.ANDROID_BUILD_TOOLS }}
           ndk: ${{ env.ANDROID_NDK_VERSION }}
 
-      - name: Locate NDK for cross-compile
-        shell: bash
-        run: |
-          set -euo pipefail
-          # build/android/Taskfile.yml 里 compile:go:shared 的查找顺序是
-          # $ANDROID_NDK_HOME → $ANDROID_SDK_ROOT/ndk/* 取最新，两个都给上最稳。
-          NDK="$(ls -d "${ANDROID_HOME}/ndk/"* 2>/dev/null | sort -V | tail -1 || true)"
-          [ -n "$NDK" ] || { echo "::error::未在 ${ANDROID_HOME}/ndk 找到 NDK，setup-android 未装上 ndk;${ANDROID_NDK_VERSION}"; exit 1; }
-          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
-          echo "NDK: $NDK"
-
+      # ANDROID_NDK_HOME 与 CGO_CFLAGS/-lm 都由 android-setup 统一设置
+      # （Point ANDROID_NDK_HOME / Prepare CGO flags 两步），PR 校验用的
+      # build.yml android job 走同一个 action，不再各写一遍。
       - name: Restore signing keystore
         id: keystore
         shell: bash
@@ -161,41 +141,6 @@ jobs:
           else
             echo "::warning::build/android/Taskfile.yml 没有 EXTRA_LDFLAGS 钩子，internal/version.Version 不会被注入（应用内会显示 dev）。重跑 scripts/bootstrap-android-assets.sh 或手工补该钩子。"
           fi
-
-      # CGO 交叉编译缺 sqlite3.h：internal/storage/sqlite.go 没有 build tag，
-      # internal/rag 的 vector_store.go / embedder_onnx.go 是 `//go:build cgo`，
-      # 而 android 的 compile:go:shared 必须 CGO_ENABLED=1（wails 的
-      # application_android.go 要 cgo），所以 sqlite-vec-go-bindings/cgo 会被编进
-      # libwails.so。它的 sqlite-vec.h 里 `#include "sqlite3.h"`，NDK sysroot 不带这个
-      # 头文件（桌面 job 靠 libsqlite3-dev 提供，本 job 的 gui-deps 是 false），于是报
-      # `fatal error: 'sqlite3.h' file not found`（编译在 sqlite-vec 处停止，ONNX 那侧
-      # 用的是仓库内 vendor 的头文件 + dlopen，不受影响）。
-      # 做法与 wails3-setup 里 Windows 的 sqlite 头文件步骤一致：取 amalgamation 的
-      # 头文件放进独立目录，只用 -I 暴露，同一个版本三平台共用一份头，避免不同平台
-      # 因头文件版本差异编出行为不一致的 sqlite-vec。
-      # 不要 apt install libsqlite3-dev 再 -I/usr/include：NDK clang 下 -I 路径的优先级
-      # 高于 target sysroot，会把 glibc 的 stdlib.h 喂给 android 编译，属于自找的苦。
-      - name: Prepare CGO flags for Android cross-compile (sqlite3.h + -lm)
-        shell: bash
-        run: |
-          set -euo pipefail
-          INC="$RUNNER_TEMP/sqlite-include"
-          mkdir -p "$INC"
-          curl -fsSL --retry 3 -o "$RUNNER_TEMP/sqlite-amalgamation.zip" \
-            "https://www.sqlite.org/2023/sqlite-amalgamation-3440000.zip"
-          # 解到临时目录再只拷头文件：amalgamation 里还有约 9MB 的 sqlite3.c / shell.c，
-          # 塞进 -I 目录只是噪音（cgo 只编包目录内的 .c，不会被误编，但目录干净更好排查）。
-          unzip -qo "$RUNNER_TEMP/sqlite-amalgamation.zip" -d "$RUNNER_TEMP/sqlite"
-          cp "$RUNNER_TEMP"/sqlite/*/sqlite3.h "$RUNNER_TEMP"/sqlite/*/sqlite3ext.h "$INC"/
-          ls -la "$INC"
-          grep -m1 'define SQLITE_VERSION ' "$INC/sqlite3.h"
-          echo "CGO_CFLAGS=${CGO_CFLAGS:-} -I${INC}" >> "$GITHUB_ENV"
-          # 顺带补 -lm（防下一次失败）：sqlite-vec 的 `#cgo linux LDFLAGS: -lm`
-          # 在 GOOS=android 下不生效 —— Go 给 android 的约束 tag 是 android+unix，
-          # 不含 linux；而 bionic 的 sqrt/fabs/ceil（sqlite-vec.c 里 9 处 sqrt）都在
-          # libm.so，不显式链接就会在 link libwails.so 时报 undefined symbol: sqrt。
-          # NDK sysroot 有 libm.so，加这个对桌面/其它 cgo 包无害。
-          echo "CGO_LDFLAGS=${CGO_LDFLAGS:-} -lm" >> "$GITHUB_ENV"
 
       - name: Build AAB (Play artifact, both ABIs)
         shell: bash
@@ -310,6 +255,11 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: build/dist/*
+          # 必须显式给 tag：action 的默认值是 github.ref，workflow_dispatch 时那是
+          # refs/heads/<branch>，会被当 tag_name 用（要么报错，要么建出一个挂在分支名
+          # 上的怪 release）。tag 触发时 ref_name 本来就是 v1.6.0，dispatch 时用解析出来
+          # 的版本补 v 前缀。
+          tag: ${{ github.event_name == 'push' && github.ref_name || format('v{0}', steps.goink_env.outputs.version) }}
           # tag 触发时桌面 release.yml 也在建同一个 release；这里只做追加，
           # 已存在就复用，避免互相覆盖。
           append_body: false

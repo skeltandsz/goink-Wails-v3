@@ -48,7 +48,9 @@ runs:
     # Wails v3 Android 用 Gradle 打包，模板要求 compileSdk/targetSdk=35（Play 新政
     # 要求新上架应用至少 target Android 15 / API 35）。
     - name: Set up JDK 21
-      uses: actions/setup-java@v4
+      # v4 已被官方标为停止维护（Actions 日志里直接给迁移提示），v5 是同 API 的
+      # Node24 运行时版本；distribution/version 行为不变。
+      uses: actions/setup-java@v5
       with:
         distribution: temurin
         java-version: '21'
@@ -63,15 +65,69 @@ runs:
           build-tools;${{ inputs.build-tools }}
           ndk;${{ inputs.ndk }}
 
+    # ---------------------------------------------------------------- NDK 选择
+    # build/android/Taskfile.yml 的 compile:go:shared 查找顺序是 $ANDROID_NDK_HOME →
+    # $ANDROID_SDK_ROOT/ndk/* 取最新。ubuntu-latest 镜像预装了好几个 NDK（实测
+    # 26.3.11579264 / 27.3.13750724 / 30.0.16248370 同时在），不显式指向 pin 的版本
+    # 就会静默落到最新的 r30，把调用方 ANDROID_NDK_VERSION 这个 pin 变成摆设，
+    # clang 版本随 runner 镜像漂移。
+    - name: Point ANDROID_NDK_HOME at the pinned NDK
+      shell: bash
+      env:
+        NDK_VERSION: ${{ inputs.ndk }}
+      run: |
+        set -euo pipefail
+        NDK="${ANDROID_HOME}/ndk/${NDK_VERSION}"
+        if [ ! -d "${NDK}" ]; then
+          echo "::warning::pin 的 ndk;${NDK_VERSION} 不在 ${ANDROID_HOME}/ndk 下（setup-android 没装上？），回退到已安装的最新 NDK，产物不再可复现"
+          NDK="$(ls -d "${ANDROID_HOME}/ndk/"* 2>/dev/null | sort -V | tail -1 || true)"
+        fi
+        [ -n "${NDK}" ] && [ -d "${NDK}" ] \
+          || { echo "::error::${ANDROID_HOME}/ndk 下没有任何 NDK"; exit 1; }
+        echo "ANDROID_NDK_HOME=${NDK}" >> "$GITHUB_ENV"
+        echo "NDK: ${NDK}"
+
+    # 放在 NDK 选定之后：wails3 doctor 会列出它实际找到的 SDK/NDK/JDK，比我们自己
+    # echo 更可信；放前面的话它只能看到 runner 的默认 NDK，日志会误导。
     - name: Report toolchain
       shell: bash
       run: |
         set -euo pipefail
         echo "ANDROID_HOME=${ANDROID_HOME:-}${ANDROID_SDK_ROOT:-}"
+        echo "ANDROID_NDK_HOME=${ANDROID_NDK_HOME:-}"
         java -version 2>&1 | head -2
         ls "$ANDROID_HOME/ndk" 2>/dev/null || true
-        # wails3 doctor 会列出它实际找到的 SDK/NDK/JDK，比我们自己 echo 更可信
         wails3 doctor || echo "::warning::wails3 doctor 报错，继续尝试构建"
+
+    # ------------------------------------------------------ CGO 交叉编译前置
+    # GOOS=android + CGO_ENABLED=1 会把 sqlite-vec（internal/storage 无 build tag、
+    # internal/rag 的 vector_store/embedder_onnx 是 //go:build cgo）编进 libwails.so，
+    # 而 NDK sysroot 里没有 sqlite3.h —— 桌面 job 靠 libsqlite3-dev 提供，Android job
+    # 的 gui-deps 是 false，于是报 `fatal error: 'sqlite3.h' file not found`。
+    # 与 wails3-setup 里 Windows 的做法一致：取 amalgamation 的头文件放独立目录，
+    # 只用 -I 暴露，三平台同一版本头。不要 apt install libsqlite3-dev 再 -I/usr/include：
+    # NDK clang 下 -I 的优先级高于 target sysroot，会把 glibc 的 stdlib.h 喂给 android。
+    - name: Prepare CGO flags for Android cross-compile (sqlite3.h + -lm)
+      shell: bash
+      run: |
+        set -euo pipefail
+        INC="$RUNNER_TEMP/sqlite-include"
+        mkdir -p "$INC"
+        curl -fsSL --retry 3 -o "$RUNNER_TEMP/sqlite-amalgamation.zip" \
+          "https://www.sqlite.org/2023/sqlite-amalgamation-3440000.zip"
+        # 解到临时目录再只拷头文件：amalgamation 里还有约 9MB 的 sqlite3.c / shell.c，
+        # 塞进 -I 目录只是噪音（cgo 只编包目录内的 .c，不会被误编，但目录干净好排查）。
+        unzip -qo "$RUNNER_TEMP/sqlite-amalgamation.zip" -d "$RUNNER_TEMP/sqlite"
+        cp "$RUNNER_TEMP"/sqlite/*/sqlite3.h "$RUNNER_TEMP"/sqlite/*/sqlite3ext.h "$INC"/
+        ls -la "$INC"
+        grep -m1 'define SQLITE_VERSION ' "$INC/sqlite3.h"
+        echo "CGO_CFLAGS=${CGO_CFLAGS:-} -I${INC}" >> "$GITHUB_ENV"
+        # 顺带补 -lm（防下一次失败）：sqlite-vec 的 `#cgo linux LDFLAGS: -lm` 在
+        # GOOS=android 下不生效 —— Go 给 android 的约束 tag 是 android+unix，不含
+        # linux；而 bionic 的 sqrt/fabs/ceil（sqlite-vec.c 里 9 处 sqrt）都在 libm.so，
+        # 不显式链接就会在 link libwails.so 时报 undefined symbol: sqrt。
+        # NDK sysroot 有 libm.so，加这个对其它 cgo 包无害。
+        echo "CGO_LDFLAGS=${CGO_LDFLAGS:-} -lm" >> "$GITHUB_ENV"
 
     # ---------------------------------------------------------------- 脚手架
     - name: Ensure build/android scaffold
@@ -130,6 +186,21 @@ runs:
         set -euo pipefail
         [ -n "${GRADLE}" ] && [ -f "$GRADLE" ] || { echo "::error::缺少 build.gradle，无法写入版本号"; exit 1; }
 
+        # version-code 只接受正整数。AGP 的 defaultConfig.versionCode 是 Integer，
+        # 把版本号（如 0.0.1）填进这个输入会被原样 sed 进 build.gradle，一路走到
+        # Gradle 配置阶段才炸，报 "A problem occurred evaluating project ':app'.
+        # > Value is null" 且只给行号（app/build.gradle:17），排查成本极高。
+        # 填成 version/version-core 同值时按"填错框"处理：忽略并自动推导，同时警告。
+        if [ -n "${VERSION_CODE_INPUT}" ] && ! [[ "${VERSION_CODE_INPUT}" =~ ^[1-9][0-9]*$ ]]; then
+          if [ "${VERSION_CODE_INPUT}" = "${VERSION}" ] || [ "${VERSION_CODE_INPUT}" = "${VERSION_CORE}" ]; then
+            echo "::warning::version_code 收到的是版本号 '${VERSION_CODE_INPUT}' 而不是整数 versionCode，按填错框处理：忽略它，改由 version-core 推导"
+            VERSION_CODE_INPUT=""
+          else
+            echo "::error::version_code 必须是正整数（Google Play 上限 2100000000），收到 '${VERSION_CODE_INPUT}'。要指定 1.6.0 这类版本号请填 version 输入，version_code 留空即按 x.y.z 推导"
+            exit 1
+          fi
+        fi
+
         if [ -n "${VERSION_CODE_INPUT}" ]; then
           VERSION_CODE="${VERSION_CODE_INPUT}"
         elif [[ "${VERSION_CORE}" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
@@ -138,6 +209,12 @@ runs:
           VERSION_CODE=$(( 10#${BASH_REMATCH[1]} * 10000 + 10#${BASH_REMATCH[2]} * 100 + 10#${BASH_REMATCH[3]} ))
         else
           echo "::error::无法从 '${VERSION_CORE}' 推导 versionCode，请用 version-code 输入显式指定"
+          exit 1
+        fi
+
+        # 推导出来的 0.0.0 会得到 versionCode 0，aapt/Play 都不接受（必须 >=1）。
+        if [ "${VERSION_CODE}" -lt 1 ] || [ "${VERSION_CODE}" -gt 2100000000 ]; then
+          echo "::error::versionCode ${VERSION_CODE} 不在 Google Play 允许的 1..2100000000 区间内"
           exit 1
         fi
 
