@@ -11,6 +11,7 @@ import ActivityBar from "@/components/shell/ActivityBar";
 import StatusBar from "@/components/shell/StatusBar";
 import WindowControls from "@/components/shell/WindowControls";
 import SidePanel from "@/components/sidebar/SidePanel";
+import { drawerWidthFor, useMobileViewport } from "@/hooks/useMobileViewport";
 import ContentPanel, {
   type ContentPanelHandle,
 } from "@/components/content/ContentPanel";
@@ -112,6 +113,22 @@ export default function WorkspaceView({
   const setActivePanel = usePanelStore((s) => s.setActivePanel);
   const setSidebarPanel = usePanelStore((s) => s.setSidebarPanel);
   const setSidebarClosed = usePanelStore((s) => s.setSidebarClosed);
+  // 移动端形态（横屏手机/矮窗口）：侧栏由"占位的第三栏"改成"覆盖式抽屉"，
+  // 选完条目自动收起，否则 800×360 的视口里正文只剩一条缝。判定阈值见
+  // hooks/useMobileViewport —— 它按 height 为主，所以桌面把窗口拖小到 1280×720
+  // 也不会误切。
+  const viewport = useMobileViewport();
+  const compact = viewport.compact;
+  const closeDrawer = () => {
+    if (compact) setSidebarClosed(true);
+  };
+  // 进入移动端形态时收起侧栏一次：只按"非紧凑 → 紧凑"这条边沿触发，之后用户在
+  // 抽屉里选东西、来回展开都不再被强制关闭（否则搜索/多选会被打断）。
+  const wasCompactRef = useRef(false);
+  useEffect(() => {
+    if (compact && !wasCompactRef.current) setSidebarClosed(true);
+    wasCompactRef.current = compact;
+  }, [compact, setSidebarClosed]);
   // focusMap 外置到 useFocusStore（2.8）。各 View 自己订阅 focusId。
   // styleSampleFocusId 语义不同（null=已处理），保留本地 state。
   const focusEntity = useFocusStore((s) => s.focusEntity);
@@ -343,7 +360,7 @@ export default function WorkspaceView({
 
   return (
     <>
-      <div className="h-screen flex flex-col overflow-hidden">
+      <div className="h-dvh flex flex-col overflow-hidden">
         <header
           className="h-11 flex items-center border-b bg-sidebar shrink-0 select-none cursor-default"
           style={{ "--wails-draggable": "drag" } as React.CSSProperties}
@@ -397,35 +414,74 @@ export default function WorkspaceView({
           </div>
         </header>
 
-        <div className="flex-1 flex min-h-0 overflow-hidden">
+        {/* relative 是给移动端抽屉当定位参照（absolute inset-y-0 left-0）。
+            桌面形态下这个 div 只是 flex 容器，加 relative 不改变布局。 */}
+        <div className="flex-1 flex min-h-0 overflow-hidden relative">
           <ActivityBar onSelect={handleActivitySelect} />
 
           {!sidebarClosed && activePanel !== "chapter-management" && (
-            <SidePanel
-              novels={novels}
-              novelId={activeNovelId}
-              onSelectNovel={handleSelectNovel}
-              onSelectChapter={handleSelectChapter}
-              onSelectGoink={handleSelectGoink}
-              onSelectVolumeOutline={handleSelectVolumeOutline}
-              onExportNovel={(id) => setExportNovelId(id)}
-              showCreate={showCreate}
-              setShowCreate={setShowCreate}
-              title={title}
-              setTitle={setTitle}
-              description={description}
-              setDescription={setDescription}
-              onCreateNovel={handleCreateNovel}
-              activeSkillName={activeSkillName}
-              onSelectSkill={handleSelectSkill}
-              onEditSkill={handleEditSkill}
-              onNewSkill={handleNewSkill}
-              onSearchNavigateEntity={handleSearchNavigateEntity}
-              onSearchNavigateChapter={handleSearchNavigateChapter}
-              onSelectStyleSample={(id) => setStyleSampleFocusId(id)}
-              sidePanelWidth={sidePanelWidth}
-              onSidePanelResize={setSidePanelWidth}
-            />
+            <>
+              {/* 遮罩：点抽屉外的区域收起。用 fixed 覆盖整屏（含顶栏），
+                  z-20 压在抽屉(z-30)之下，抽屉内的下拉/弹窗不会被它挡。 */}
+              {compact && (
+                <div
+                  className="fixed inset-0 z-20 bg-black/40"
+                  onClick={closeDrawer}
+                  aria-hidden="true"
+                />
+              )}
+              <div
+                className={
+                  compact
+                    ? "absolute inset-y-0 left-0 z-30 flex"
+                    : "relative flex"
+                }
+              >
+                {/* 移动端选完条目即收起抽屉：抽屉是覆盖式的，不收起就一直在正文上面 */}
+                <SidePanel
+                  novels={novels}
+                  novelId={activeNovelId}
+                  onSelectNovel={(n) => {
+                    void handleSelectNovel(n);
+                    closeDrawer();
+                  }}
+                  onSelectChapter={(id) => {
+                    handleSelectChapter(id);
+                    closeDrawer();
+                  }}
+                  onSelectGoink={() => {
+                    handleSelectGoink();
+                    closeDrawer();
+                  }}
+                  onSelectVolumeOutline={(path, volumeName) => {
+                    handleSelectVolumeOutline(path, volumeName);
+                    closeDrawer();
+                  }}
+                  onExportNovel={(id) => setExportNovelId(id)}
+                  showCreate={showCreate}
+                  setShowCreate={setShowCreate}
+                  title={title}
+                  setTitle={setTitle}
+                  description={description}
+                  setDescription={setDescription}
+                  onCreateNovel={handleCreateNovel}
+                  activeSkillName={activeSkillName}
+                  onSelectSkill={(path, title, readOnly) => {
+                    handleSelectSkill(path, title, readOnly);
+                    closeDrawer();
+                  }}
+                  onEditSkill={handleEditSkill}
+                  onNewSkill={handleNewSkill}
+                  onSearchNavigateEntity={handleSearchNavigateEntity}
+                  onSearchNavigateChapter={handleSearchNavigateChapter}
+                  onSelectStyleSample={(id) => setStyleSampleFocusId(id)}
+                  sidePanelWidth={
+                    compact ? drawerWidthFor(viewport.width) : sidePanelWidth
+                  }
+                  onSidePanelResize={setSidePanelWidth}
+                />
+              </div>
+            </>
           )}
 
           {activePanel === "chapter-management" ? (

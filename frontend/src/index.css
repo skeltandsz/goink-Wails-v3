@@ -24,6 +24,43 @@
   -moz-osx-font-smoothing: grayscale;
 }
 
+/* ── 移动端（Android WebView）适配 ────────────────────────────
+   横屏锁定后手机视口大约 800×360 CSS px，而这套界面按桌面 ≥1280 宽设计。
+   字号走 rem（Tailwind 的 text-* 全部基于 html 的 font-size），所以只调
+   html 的基准字号就能整体等比收缩，不用去改每个组件的 px。
+   断点用 height 而不是 width：横屏手机的特征是"矮"，桌面窗口很少矮到 480。
+   clamp 的下限防止在极矮视口上把正文压到不可读。 */
+@supports (height: 100dvh) {
+  :root {
+    --safe-area-inset-top: env(safe-area-inset-top, 0px);
+    --safe-area-inset-right: env(safe-area-inset-right, 0px);
+    --safe-area-inset-bottom: env(safe-area-inset-bottom, 0px);
+    --safe-area-inset-left: env(safe-area-inset-left, 0px);
+  }
+
+  /* 矮视口（横屏手机/平板分屏）：收紧基准字号，让三栏都能容得下 */
+  @media (max-height: 480px) {
+    html {
+      font-size: clamp(13px, 1.9dvh, 15px);
+    }
+  }
+
+  /* 又矮又窄（小屏手机横屏）：再收一档，配合组件侧的抽屉折叠（见 useCompactViewport） */
+  @media (max-height: 400px) and (max-width: 760px) {
+    html {
+      font-size: 13px;
+    }
+  }
+
+  /* 触摸设备上 6px 的桌面滚动条几乎点不中，加粗到可触摸 */
+  @media (pointer: coarse) {
+    ::-webkit-scrollbar {
+      width: 10px;
+      height: 10px;
+    }
+  }
+}
+
 /* ── 浅色主题 ────────────────────────────────────────────── */
 
 :root,
@@ -187,9 +224,18 @@
 
 body {
   margin: 0;
+  /* 100vh 在移动端是"最大可能视口"，地址栏/手势条出现与隐藏时它会变，
+     导致整块工作台高度跳动并被裁底；100dvh 跟随实际可见高度。保留 100vh
+     作为不支持 dvh 的旧内核兜底（顺序不能反：@supports 里的覆盖才生效）。 */
   min-height: 100vh;
   overflow: hidden;
   overscroll-behavior: none;
+}
+
+@supports (height: 100dvh) {
+  body {
+    min-height: 100dvh;
+  }
 }
 
 #root {
@@ -197,6 +243,12 @@ body {
   overflow: hidden;
   display: flex;
   flex-direction: column;
+}
+
+@supports (height: 100dvh) {
+  #root {
+    min-height: 100dvh;
+  }
 }
 
 @theme inline {
