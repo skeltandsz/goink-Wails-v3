@@ -287,6 +287,9 @@ body {
   }
   html {
     overflow: hidden;
+    /* 全局界面缩放（移动端 WebView 适配）：由 index.html 首屏脚本与 src/lib/uiScale.ts 写入；
+       变量缺省时为 1，桌面默认不受影响。见 src/lib/uiScale.ts 顶部说明。 */
+    zoom: var(--goink-ui-scale, 1);
     @apply font-sans;
   }
 }

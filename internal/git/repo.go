@@ -1,12 +1,10 @@
 package git
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -14,14 +12,17 @@ import (
 	"time"
 
 	"github.com/sigpanic/goink/internal/config"
-	"github.com/sigpanic/goink/internal/platform"
 )
 
 // Repo 管理单部小说的 Git 仓库，提供文件读写和版本控制。
+//
+// Repo 只做参数/结果转发，具体实现由 backend 决定（外部 git CLI 或内置 go-git，
+// 选择逻辑见 newBackend）。对 app/ 与 internal/ 的调用方而言，Repo 的导出方法
+// 签名与抽出 backend 之前完全一致。
 type Repo struct {
-	dir    string
-	gitBin string
-	logger *slog.Logger
+	dir     string
+	backend backend
+	logger  *slog.Logger
 }
 
 // CommitInfo 是 git log 的单条记录。
@@ -45,18 +46,23 @@ type FileDiff struct {
 	ModifiedContent string `json:"modified"`
 }
 
+// FileEntry 表示 commit 中一个变更文件的简要信息（不含内容）。
+type FileEntry struct {
+	Path       string `json:"path"`
+	ChangeType string `json:"changeType"` // "added" | "modified" | "deleted" | "renamed"
+	OldPath    string `json:"oldPath"`    // 仅 renamed 时有值，表示重命名前的路径
+}
+
 // New 为指定小说打开已有仓库，不存在则 git init + 首次空 commit。
 // gitName 和 gitEmail 用于设置仓库级 git config。空字符串时使用默认值。
 // logger 为 nil 时使用 slog.Default()。
+//
+// 找不到外部 git 可执行文件不再视为致命错误：Android 等环境会自动改用内置
+// go-git 后端（见 newBackend），建库/历史/回滚照常工作。
 func New(novelID int64, gitName, gitEmail string, logger *slog.Logger) (*Repo, error) {
 	cfg := config.Get()
 	if cfg == nil {
 		return nil, fmt.Errorf("git: config not initialized")
-	}
-
-	gitBin, err := platform.ResolveGit()
-	if err != nil {
-		return nil, fmt.Errorf("git: 找不到 git 可执行文件: %w", err)
 	}
 
 	if gitName == "" {
@@ -66,11 +72,16 @@ func New(novelID int64, gitName, gitEmail string, logger *slog.Logger) (*Repo, e
 		gitEmail = "goink@local"
 	}
 
-	dir := config.NovelDirPath(novelID)
 	if logger == nil {
 		logger = slog.Default()
 	}
-	r := &Repo{dir: dir, gitBin: gitBin, logger: logger}
+
+	dir := config.NovelDirPath(novelID)
+	be, err := newBackend(dir, logger)
+	if err != nil {
+		return nil, err
+	}
+	r := &Repo{dir: dir, backend: be, logger: logger}
 
 	if _, err := os.Stat(filepath.Join(dir, ".git")); err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
@@ -79,156 +90,77 @@ func New(novelID int64, gitName, gitEmail string, logger *slog.Logger) (*Repo, e
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			return nil, fmt.Errorf("git: create novel dir: %w", err)
 		}
-		if _, stderr, err := r.runInDir("init", dir); err != nil {
-			return nil, fmt.Errorf("git: init: %s: %w", stderr, err)
-		}
-		// 仓库级 git config，避免用户未全局配置时 commit 失败
-		if _, stderr, err := r.runInDir("config", "user.name", gitName); err != nil {
-			return nil, fmt.Errorf("git: config user.name: %s: %w", stderr, err)
-		}
-		if _, stderr, err := r.runInDir("config", "user.email", gitEmail); err != nil {
-			return nil, fmt.Errorf("git: config user.email: %s: %w", stderr, err)
-		}
-		gitkeep := filepath.Join(dir, "chapters", ".gitkeep")
-		if err := os.MkdirAll(filepath.Dir(gitkeep), 0755); err != nil {
-			return nil, fmt.Errorf("git: create chapters dir: %w", err)
-		}
-		if err := os.WriteFile(gitkeep, nil, 0644); err != nil {
-			return nil, fmt.Errorf("git: write .gitkeep: %w", err)
-		}
-		if _, _, err := r.runInDir("add", "chapters/.gitkeep"); err != nil {
-			return nil, fmt.Errorf("git: stage .gitkeep: %w", err)
-		}
-		if _, _, err := r.runInDir("commit", "-m", "initial commit"); err != nil {
-			return nil, fmt.Errorf("git: initial commit: %w", err)
+		if err := be.initFresh(gitName, gitEmail); err != nil {
+			return nil, err
 		}
 	}
 
 	return r, nil
 }
 
+// BackendName 返回当前生效的后端标识（"cli" / "gogit"），供日志与诊断使用。
+func (r *Repo) BackendName() string { return r.backend.name() }
+
 // SetGitConfig 在已有仓库上更新仓库级 user.name / user.email 配置。
 func (r *Repo) SetGitConfig(gitName, gitEmail string) error {
-	if _, stderr, err := r.runInDir("config", "user.name", gitName); err != nil {
-		return fmt.Errorf("git: config user.name: %s: %w", stderr, err)
-	}
-	if _, stderr, err := r.runInDir("config", "user.email", gitEmail); err != nil {
-		return fmt.Errorf("git: config user.email: %s: %w", stderr, err)
-	}
-	return nil
+	return r.backend.setIdentity(gitName, gitEmail)
 }
 
 // ── Diff ──────────────────────────────────────────────────
 
 // DiffContent 对比当前工作区文件与 proposed 内容，返回 unified diff。
-// 文件不存在时以空内容为基准。用临时文件 + git diff --no-index 实现。
+// 文件不存在时以空内容为基准。
 func (r *Repo) DiffContent(relPath, proposed string) (string, error) {
-	fromPath := relPath
-	fullPath := filepath.Join(r.dir, relPath)
-
-	if _, err := os.Stat(fullPath); errors.Is(err, os.ErrNotExist) {
-		empty, err := os.CreateTemp("", "git-diff-empty-*")
-		if err != nil {
-			return "", fmt.Errorf("git: diff: create empty temp: %w", err)
-		}
-		empty.Close()
-		defer os.Remove(empty.Name())
-		fromPath = empty.Name()
-	}
-
-	tmp, err := os.CreateTemp("", "git-diff-*"+filepath.Ext(relPath))
-	if err != nil {
-		return "", fmt.Errorf("git: diff: create temp: %w", err)
-	}
-	defer os.Remove(tmp.Name())
-
-	if _, err := tmp.WriteString(proposed); err != nil {
-		tmp.Close()
-		return "", fmt.Errorf("git: diff: write temp: %w", err)
-	}
-	tmp.Close()
-
-	stdout, stderr, err := r.runInDir("diff", "--no-index", "--", fromPath, tmp.Name())
-	// git diff 有差异时 exit 1，stdout 有内容；exit >1 才是真正的错误
-	if err != nil && stdout == "" {
-		return "", fmt.Errorf("git: diff: %s: %w", stderr, err)
-	}
-	stdout = strings.ReplaceAll(stdout, filepath.ToSlash(tmp.Name()), "/"+relPath)
-	if fromPath != relPath {
-		stdout = strings.ReplaceAll(stdout, filepath.ToSlash(fromPath), "/dev/null")
-	}
-	return stdout, nil
+	return r.backend.diffContent(relPath, proposed)
 }
 
 // ── Git 操作 ──────────────────────────────────────────────
 
 func (r *Repo) StageAll() error {
-	_, stderr, err := r.runInDir("add", "-A")
-	if err != nil {
-		return fmt.Errorf("git: stage all: %s: %w", stderr, err)
-	}
-	return nil
+	return r.backend.stageAll()
 }
 
 func (r *Repo) Commit(msg string) (string, error) {
-	_, stderr, err := r.runInDir("commit", "-m", msg)
-	if err != nil {
-		return "", fmt.Errorf("git: commit: %s: %w", stderr, err)
-	}
-	hash, _, err := r.runInDir("rev-parse", "HEAD")
-	if err != nil {
-		return "", fmt.Errorf("git: rev-parse after commit: %s: %w", stderr, err)
-	}
-	return strings.TrimSpace(hash), nil
+	return r.backend.commit(msg)
 }
 
 func (r *Repo) HasUncommitted() (bool, error) {
-	out, _, err := r.runInDir("status", "--porcelain")
-	if err != nil {
-		return false, fmt.Errorf("git: status: %w", err)
-	}
-	return strings.TrimSpace(out) != "", nil
+	return r.backend.hasUncommitted()
 }
 
 // RevertNoCommit 逆序 revert 所有 hash，仅暂存不提交。冲突时自动 abort。
 // 调用方负责最终 commit（或 abort）。
 func (r *Repo) RevertNoCommit(hashes []string) error {
-	for i := len(hashes) - 1; i >= 0; i-- {
-		_, stderr, err := r.runInDir("revert", "--no-commit", hashes[i])
-		if err != nil {
-			if _, _, abortErr := r.runInDir("revert", "--abort"); abortErr != nil {
-				return fmt.Errorf("git: revert %s: %s: %w; abort 也失败: %v", hashes[i], stderr, err, abortErr)
-			}
-			return fmt.Errorf("git: revert %s: %s: %w", hashes[i], stderr, err)
-		}
-	}
-	return nil
+	return r.backend.revertNoCommit(hashes)
 }
 
 // RevertAbort 取消进行中的 revert，丢弃所有暂存的 revert 内容。
 func (r *Repo) RevertAbort() error {
-	_, stderr, err := r.runInDir("revert", "--abort")
-	if err != nil {
-		return fmt.Errorf("git: revert --abort: %s: %w", stderr, err)
-	}
-	return nil
+	return r.backend.revertAbort()
 }
 
 func (r *Repo) Log(relPath string, n int) ([]CommitInfo, error) {
-	args := []string{"log", "--format=%H%x00%s%x00%ct"}
-	if n > 0 {
-		args = append(args, "-n", strconv.Itoa(n))
-	}
-	if relPath != "" {
-		args = append(args, "--", relPath)
-	}
-
-	stdout, stderr, err := r.runInDir(args...)
-	if err != nil {
-		return nil, fmt.Errorf("git: log: %s: %w", stderr, err)
-	}
-	return parseLog(stdout), nil
+	return r.backend.log(relPath, n)
 }
+
+// LogDetailed 返回带详细统计的提交历史，按时间降序（最新在前）。
+// afterHash 非空时，返回该 commit 之后的更早提交。
+func (r *Repo) LogDetailed(n int, afterHash string) ([]CommitInfo, error) {
+	return r.backend.logDetailed(n, afterHash)
+}
+
+// CommitFileList 返回指定 commit 的详细信息和变更文件列表（不含文件内容）。
+func (r *Repo) CommitFileList(hash string) (*CommitInfo, []FileEntry, error) {
+	return r.backend.commitFileList(hash)
+}
+
+// ShowFile 返回指定 commit 中某个文件的前后内容。
+// 对于 added 文件 original 为空，对于 deleted 文件 modified 为空。
+func (r *Repo) ShowFile(hash, filePath string) (*FileDiff, error) {
+	return r.backend.showFile(hash, filePath)
+}
+
+// ── log 解析（CLI 后端专用，两个后端共用排序约定）──────────
 
 func parseLog(out string) []CommitInfo {
 	if strings.TrimSpace(out) == "" {
@@ -255,29 +187,6 @@ func parseLog(out string) []CommitInfo {
 		return commits[i].Time.Before(commits[j].Time)
 	})
 	return commits
-}
-
-// LogDetailed 返回带详细统计的提交历史，按时间降序（最新在前）。
-// afterHash 非空时，返回该 commit 之后的更早提交（基于 git log <afterHash> --skip=1）。
-func (r *Repo) LogDetailed(n int, afterHash string) ([]CommitInfo, error) {
-	var args []string
-	if afterHash != "" {
-		args = []string{"log", afterHash, "--skip=1", "-n", strconv.Itoa(n),
-			"--format=---%n%H%n%h%n%an%n%ae%n%s%n%ct",
-			"--numstat"}
-	} else {
-		args = []string{"log", "-n", strconv.Itoa(n),
-			"--format=---%n%H%n%h%n%an%n%ae%n%s%n%ct",
-			"--numstat"}
-	}
-	stdout, stderr, err := r.runInDir(args...)
-	if err != nil {
-		if strings.Contains(stderr, "does not have any commits yet") {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("git: log detailed: %s: %w", stderr, err)
-	}
-	return parseDetailedLog(stdout), nil
 }
 
 func parseDetailedLog(out string) []CommitInfo {
@@ -355,225 +264,40 @@ func parseDetailedLog(out string) []CommitInfo {
 	return commits
 }
 
-// FileEntry 表示 commit 中一个变更文件的简要信息（不含内容）。
-type FileEntry struct {
-	Path       string `json:"path"`
-	ChangeType string `json:"changeType"` // "added" | "modified" | "deleted" | "renamed"
-	OldPath    string `json:"oldPath"`    // 仅 renamed 时有值，表示重命名前的路径
+// shortHashOf 取 commit hash 的短形式，与 `git log %h` 保持同样的 7 位约定。
+// 两个后端共用：CLI 后端由 git 自己输出，go-git 后端没有等价的 --abbrev 实现。
+func shortHashOf(hash string) string {
+	if len(hash) <= 7 {
+		return hash
+	}
+	return hash[:7]
 }
 
-// commitFileChanges 获取指定 commit 的变更文件列表（不含内容）。
-// 返回是否有父 commit 和文件变更条目。
-func (r *Repo) commitFileChanges(hash string) (bool, []FileEntry, error) {
-	hasParent := true
-	if _, _, err := r.runInDir("rev-parse", hash+"^"); err != nil {
-		hasParent = false
-	}
-
-	if !hasParent {
-		treeOut, _, err := r.runInDir("ls-tree", "-r", "--name-only", hash)
-		if err != nil {
-			return false, nil, fmt.Errorf("git: ls-tree %s: %w", hash, err)
-		}
-		var entries []FileEntry
-		for _, p := range strings.Split(strings.TrimSpace(treeOut), "\n") {
-			p = strings.TrimSpace(p)
-			if p == "" {
-				continue
-			}
-			entries = append(entries, FileEntry{Path: p, ChangeType: "added"})
-		}
-		return false, entries, nil
-	}
-
-	diffOut, _, err := r.runInDir("diff-tree", "--no-commit-id", "-r", "-M", "--name-status", hash)
-	if err != nil {
-		return true, nil, fmt.Errorf("git: diff-tree %s: %w", hash, err)
-	}
-	var entries []FileEntry
-	for _, line := range strings.Split(strings.TrimSpace(diffOut), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		parts := strings.SplitN(line, "\t", 3)
-		if len(parts) < 2 {
-			continue
-		}
-		status := parts[0]
-		changeTypeStr := "modified"
-		var oldPath string
-		switch {
-		case strings.HasPrefix(status, "A"):
-			changeTypeStr = "added"
-		case strings.HasPrefix(status, "D"):
-			changeTypeStr = "deleted"
-		case strings.HasPrefix(status, "R"):
-			changeTypeStr = "renamed"
-			if len(parts) >= 3 {
-				oldPath = parts[1]
-			}
-		}
-		// 非 rename: parts[1] 是文件路径；rename: parts[1] 是旧路径, parts[2] 是新路径
-		filePath := parts[1]
-		if changeTypeStr == "renamed" && len(parts) >= 3 {
-			filePath = parts[2]
-		}
-		entries = append(entries, FileEntry{Path: filePath, ChangeType: changeTypeStr, OldPath: oldPath})
-	}
-	return true, entries, nil
+// subjectOf 取 commit message 的首行，与 CLI 的 %s 一致。
+func subjectOf(message string) string {
+	return strings.SplitN(message, "\n", 2)[0]
 }
 
-// showFileContent 执行 git show 并处理文件不存在的错误。
-func (r *Repo) showFileContent(ref string) (string, error) {
-	content, _, err := r.runInDir("show", ref)
-	if err != nil {
-		if isNotExistInGit(err) {
-			r.logger.Debug("git show: file not in commit", "ref", ref)
-			return "", nil
-		}
-		return "", err
+// ── 测试与诊断用的原始 CLI 通道 ────────────────────────────
+
+// newCLIRepo 直接以 CLI 后端构造 Repo，绕过 config 与 platform.ResolveGit 查找。
+// 仅供包内测试（repo_test.go 的白盒用例）使用。
+func newCLIRepo(dir, gitBin string, logger *slog.Logger) *Repo {
+	if logger == nil {
+		logger = slog.Default()
 	}
-	return content, nil
+	return &Repo{dir: dir, backend: &cliBackend{dir: dir, gitBin: gitBin, logger: logger}, logger: logger}
 }
 
-// CommitFileList 返回指定 commit 的详细信息和变更文件列表（不含文件内容）。
-func (r *Repo) CommitFileList(hash string) (*CommitInfo, []FileEntry, error) {
-	logOut, _, err := r.runInDir("log", "-n", "1",
-		"--format=---%n%H%n%h%n%an%n%ae%n%s%n%ct", hash)
-	if err != nil {
-		return nil, nil, fmt.Errorf("git: commit info %s: %w", hash, err)
-	}
-	parsed := parseDetailedLog(logOut)
-	if len(parsed) == 0 {
-		return nil, nil, fmt.Errorf("git: commit %s not found", hash)
-	}
-	commit := parsed[0]
-
-	_, entries, err := r.commitFileChanges(hash)
-	if err != nil {
-		return nil, nil, err
-	}
-	return &commit, entries, nil
-}
-
-// ShowFile 返回指定 commit 中某个文件的前后内容。
-// 对于 added 文件 original 为空，对于 deleted 文件 modified 为空。
-func (r *Repo) ShowFile(hash, filePath string) (*FileDiff, error) {
-	_, entries, err := r.commitFileChanges(hash)
-	if err != nil {
-		return nil, err
-	}
-
-	var entry *FileEntry
-	for i := range entries {
-		if entries[i].Path == filePath {
-			entry = &entries[i]
-			break
-		}
-	}
-	if entry == nil {
-		return nil, fmt.Errorf("git: file %s not found in commit %s", filePath, hash)
-	}
-
-	var original, modified string
-	switch entry.ChangeType {
-	case "added":
-		modified, err = r.showFileContent(hash + ":" + filePath)
-		if err != nil {
-			return nil, fmt.Errorf("git show %s:%s: %w", hash, filePath, err)
-		}
-	case "modified":
-		original, err = r.showFileContent(hash + "^:" + filePath)
-		if err != nil {
-			return nil, fmt.Errorf("git show %s^:%s: %w", hash, filePath, err)
-		}
-		modified, err = r.showFileContent(hash + ":" + filePath)
-		if err != nil {
-			return nil, fmt.Errorf("git show %s:%s: %w", hash, filePath, err)
-		}
-	case "deleted":
-		original, err = r.showFileContent(hash + "^:" + filePath)
-		if err != nil {
-			return nil, fmt.Errorf("git show %s^:%s: %w", hash, filePath, err)
-		}
-	case "renamed":
-		original, err = r.showFileContent(hash + "^:" + entry.OldPath)
-		if err != nil {
-			return nil, fmt.Errorf("git show %s^:%s: %w", hash, entry.OldPath, err)
-		}
-		modified, err = r.showFileContent(hash + ":" + filePath)
-		if err != nil {
-			return nil, fmt.Errorf("git show %s:%s: %w", hash, filePath, err)
-		}
-	}
-
-	return &FileDiff{
-		Path:            filePath,
-		ChangeType:      entry.ChangeType,
-		OriginalContent: original,
-		ModifiedContent: modified,
-	}, nil
-}
-
-// isNotExistInGit 判断 git show 错误是否为文件不存在（正常情况）。
-// git 子进程强制 LC_ALL=C，所有输出均为英文。
-func isNotExistInGit(err error) bool {
-	msg := err.Error()
-	return strings.Contains(msg, "does not exist") ||
-		strings.Contains(msg, "not found")
-}
-
-// ── CLI ───────────────────────────────────────────────────
-
+// runInDir 把参数直接透传给 git 子进程，供白盒测试构造特定仓库状态。
+// 非 CLI 后端（go-git）没有对应的 raw 通道，调用会得到明确错误而不是 panic。
 func (r *Repo) runInDir(args ...string) (stdout, stderr string, err error) {
-	return runCmd(r.gitBin, r.dir, args...)
-}
-
-func runCmd(gitBin, dir string, args ...string) (stdout, stderr string, err error) {
-	// -c 是 git 的全局选项，必须置于子命令之前（git -c k=v commit 正确，
-	// git commit -c k=v 会被解析成「复用指定 commit 的消息」）。覆盖项用于切断
-	// 小说仓库对用户全局 git 配置的继承，生产与测试的全部 git 调用都经此处：
-	//   - commit.gpgsign=false：用户全局开启签名时，Goink 作为无 tty 的 GUI 进程
-	//     无法完成 pinentry，commit 会失败，表现为「保存章节失败」。
-	//   - core.hooksPath=.goink-no-hooks：用户全局 hooksPath 指向自定义 hook 目录时，
-	//     其中的 pre-commit 会拦截 Goink 的 commit；这里指向一个必然不存在的相对
-	//     目录，等价于禁用 hook。相对路径相对工作区根（cmd.Dir）解析，跨平台一致。
-	//   - core.quotepath=false：默认 true 会把 ls-tree / diff-tree 输出里的非 ASCII
-	//     路径转义成 "\346\210\221..." 形式，导致 commitFileChanges 返回的 Path 与
-	//     前端传入的 UTF-8 路径无法匹配，历史 diff 打不开。置 false 输出原始 UTF-8。
-	fullArgs := append([]string{
-		"-c", "commit.gpgsign=false",
-		"-c", "core.hooksPath=.goink-no-hooks",
-		"-c", "core.quotepath=false",
-	}, args...)
-
-	cmd := exec.Command(gitBin, fullArgs...)
-	cmd.Dir = dir
-	cmd.Env = filteredGitEnv()
-	var outBuf, errBuf bytes.Buffer
-	cmd.Stdout = &outBuf
-	cmd.Stderr = &errBuf
-	platform.SetPlatformAttr(cmd)
-	err = cmd.Run()
-	return outBuf.String(), errBuf.String(), err
-}
-
-// filteredGitEnv 返回剥离所有 GIT_ 前缀环境变量后的 env 列表，并追加 LC_ALL=C。
-//
-// GIT_* 是 git 的覆盖/劫持命名空间（GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE /
-// GIT_AUTHOR_* 等）。当本进程处于 git hook 子进程内时（例如 pre-commit 触发 go test），
-// git 会向环境注入 GIT_DIR 等绝对路径，导致 Repo 经 runCmd 派生的 git 子进程被劫持到
-// 父仓库而非 cmd.Dir 指向的目标仓库。剥离 GIT_* 从根上消除该劫持。
-//
-// Repo 始终通过 cmd.Dir 定位仓库、从不依赖 GIT_DIR，故剥离对生产零副作用；
-// HOME / PATH / 系统变量等 git 真正需要的环境变量（非 GIT_ 前缀）原样保留。
-func filteredGitEnv() []string {
-	env := make([]string, 0, len(os.Environ())+1)
-	for _, kv := range os.Environ() {
-		if !strings.HasPrefix(kv, "GIT_") {
-			env = append(env, kv)
-		}
+	cb, ok := r.backend.(*cliBackend)
+	if !ok {
+		return "", "", fmt.Errorf("git: raw git 调用只支持 cli 后端，当前是 %s 后端", r.backend.name())
 	}
-	return append(env, "LC_ALL=C")
+	return cb.run(args...)
 }
+
+// Dir 返回小说仓库根目录（绝对路径），供需要与工作区文件直接打交道的后端实现复用。
+func (r *Repo) Dir() string { return r.dir }

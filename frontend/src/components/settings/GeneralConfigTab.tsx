@@ -8,6 +8,7 @@ import {
   Loader2,
   CheckCircle2,
   AlertCircle,
+  ZoomIn,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import {
@@ -23,6 +24,12 @@ import { useRebuildNovelIndex } from "./useRebuildNovelIndex";
 import UpdateDialog from "@/components/update/UpdateDialog";
 import { toastError } from "@/utils/toast";
 import { toErrorMessage } from "@/utils/error";
+import {
+  getUiScaleInfo,
+  setUiScalePreference,
+  subscribeUiScale,
+} from "@/lib/uiScale";
+import type { UiScaleInfo } from "@/lib/uiScale";
 
 export default function GeneralConfigTab() {
   const { t, i18n } = useTranslation();
@@ -46,6 +53,16 @@ export default function GeneralConfigTab() {
     useState<updateModels.CheckResult | null>(null);
   const [updateError, setUpdateError] = useState<string | null>(null);
   const [showUpdateDialog, setShowUpdateDialog] = useState(false);
+  // 界面缩放：档位由 src/lib/uiScale.ts 管理（localStorage 持久化），此处只做显示与切换。
+  const [scaleInfo, setScaleInfo] = useState<UiScaleInfo>(() => getUiScaleInfo());
+
+  useEffect(() => subscribeUiScale(setScaleInfo), []);
+
+  // 切到手动时，用当前生效档位作为起点（对齐到 5% 步进，与滑杆 min 30/step 5 一致）。
+  function handleManualSeed() {
+    const seed = Math.round((scaleInfo.scale * 100 - 30) / 5) * 5 + 30;
+    setUiScalePreference(seed);
+  }
 
   // GetAppConfig: 直接 import wailsjs（无结构化类型，启动读一次，query 化收益低）。
   // 失败时 toast 提示（原静默吞错违反规则 9），dataDir 保持空字符串 UI 正常渲染。
@@ -294,6 +311,56 @@ export default function GeneralConfigTab() {
               {updateError}
             </span>
           )}
+        </div>
+      </div>
+
+      <div className="mt-6 space-y-2">
+        <label className="text-xs font-medium text-muted-foreground flex items-center gap-1.5">
+          <ZoomIn className="w-3.5 h-3.5" />
+          {t("settings.uiScale")}
+        </label>
+        <p className="text-[11px] text-muted-foreground">
+          {t("settings.uiScaleDesc")}
+        </p>
+        <div className="flex items-center gap-2">
+          <div className="inline-flex items-center gap-1 rounded-lg bg-muted/60 p-0.5">
+            <button
+              onClick={() => setUiScalePreference("auto")}
+              className={`h-7 px-3 rounded-md text-xs transition-colors ${
+                scaleInfo.source === "auto"
+                  ? "bg-background text-foreground shadow-sm"
+                  : "text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              {t("settings.uiScaleAuto")}
+            </button>
+            <button
+              onClick={handleManualSeed}
+              className={`h-7 px-3 rounded-md text-xs transition-colors ${
+                scaleInfo.source === "manual"
+                  ? "bg-background text-foreground shadow-sm"
+                  : "text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              {t("settings.uiScaleManual")}
+            </button>
+          </div>
+          {scaleInfo.source === "manual" && (
+            <input
+              type="range"
+              min={30}
+              max={120}
+              step={5}
+              value={scaleInfo.manualPercent ?? 100}
+              onChange={(e) => setUiScalePreference(Number(e.target.value))}
+              className="w-32 accent-primary"
+            />
+          )}
+          <span className="text-[11px] text-muted-foreground">
+            {t("settings.uiScaleCurrent", {
+              percent: Math.round(scaleInfo.scale * 100),
+            })}
+          </span>
         </div>
       </div>
 

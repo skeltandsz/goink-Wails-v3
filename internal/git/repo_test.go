@@ -29,7 +29,7 @@ func testRepo(t *testing.T, commits int) (*Repo, string, func()) {
 		t.Fatalf("create temp dir: %v", err)
 	}
 
-	r := &Repo{dir: dir, gitBin: "git"}
+	r := newCLIRepo(dir, "git", nil)
 
 	// git init
 	_, stderr, err := r.runInDir("init")
@@ -76,7 +76,7 @@ func testRepo(t *testing.T, commits int) (*Repo, string, func()) {
 // 能覆盖 local 即可覆盖 global。
 func TestRunCmd_IsolatesGitConfig(t *testing.T) {
 	dir := t.TempDir()
-	r := &Repo{dir: dir, gitBin: "git"}
+	r := newCLIRepo(dir, "git", nil)
 	if _, stderr, err := r.runInDir("init"); err != nil {
 		t.Fatalf("git init: %s: %v", stderr, err)
 	}
