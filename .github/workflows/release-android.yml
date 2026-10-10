@@ -162,6 +162,41 @@ jobs:
             echo "::warning::build/android/Taskfile.yml 没有 EXTRA_LDFLAGS 钩子，internal/version.Version 不会被注入（应用内会显示 dev）。重跑 scripts/bootstrap-android-assets.sh 或手工补该钩子。"
           fi
 
+      # CGO 交叉编译缺 sqlite3.h：internal/storage/sqlite.go 没有 build tag，
+      # internal/rag 的 vector_store.go / embedder_onnx.go 是 `//go:build cgo`，
+      # 而 android 的 compile:go:shared 必须 CGO_ENABLED=1（wails 的
+      # application_android.go 要 cgo），所以 sqlite-vec-go-bindings/cgo 会被编进
+      # libwails.so。它的 sqlite-vec.h 里 `#include "sqlite3.h"`，NDK sysroot 不带这个
+      # 头文件（桌面 job 靠 libsqlite3-dev 提供，本 job 的 gui-deps 是 false），于是报
+      # `fatal error: 'sqlite3.h' file not found`（编译在 sqlite-vec 处停止，ONNX 那侧
+      # 用的是仓库内 vendor 的头文件 + dlopen，不受影响）。
+      # 做法与 wails3-setup 里 Windows 的 sqlite 头文件步骤一致：取 amalgamation 的
+      # 头文件放进独立目录，只用 -I 暴露，同一个版本三平台共用一份头，避免不同平台
+      # 因头文件版本差异编出行为不一致的 sqlite-vec。
+      # 不要 apt install libsqlite3-dev 再 -I/usr/include：NDK clang 下 -I 路径的优先级
+      # 高于 target sysroot，会把 glibc 的 stdlib.h 喂给 android 编译，属于自找的苦。
+      - name: Prepare CGO flags for Android cross-compile (sqlite3.h + -lm)
+        shell: bash
+        run: |
+          set -euo pipefail
+          INC="$RUNNER_TEMP/sqlite-include"
+          mkdir -p "$INC"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/sqlite-amalgamation.zip" \
+            "https://www.sqlite.org/2023/sqlite-amalgamation-3440000.zip"
+          # 解到临时目录再只拷头文件：amalgamation 里还有约 9MB 的 sqlite3.c / shell.c，
+          # 塞进 -I 目录只是噪音（cgo 只编包目录内的 .c，不会被误编，但目录干净更好排查）。
+          unzip -qo "$RUNNER_TEMP/sqlite-amalgamation.zip" -d "$RUNNER_TEMP/sqlite"
+          cp "$RUNNER_TEMP"/sqlite/*/sqlite3.h "$RUNNER_TEMP"/sqlite/*/sqlite3ext.h "$INC"/
+          ls -la "$INC"
+          grep -m1 'define SQLITE_VERSION ' "$INC/sqlite3.h"
+          echo "CGO_CFLAGS=${CGO_CFLAGS:-} -I${INC}" >> "$GITHUB_ENV"
+          # 顺带补 -lm（防下一次失败）：sqlite-vec 的 `#cgo linux LDFLAGS: -lm`
+          # 在 GOOS=android 下不生效 —— Go 给 android 的约束 tag 是 android+unix，
+          # 不含 linux；而 bionic 的 sqrt/fabs/ceil（sqlite-vec.c 里 9 处 sqrt）都在
+          # libm.so，不显式链接就会在 link libwails.so 时报 undefined symbol: sqrt。
+          # NDK sysroot 有 libm.so，加这个对桌面/其它 cgo 包无害。
+          echo "CGO_LDFLAGS=${CGO_LDFLAGS:-} -lm" >> "$GITHUB_ENV"
+
       - name: Build AAB (Play artifact, both ABIs)
         shell: bash
         env:
