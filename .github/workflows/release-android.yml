@@ -68,6 +68,28 @@ jobs:
         with:
           fetch-depth: 0
 
+      # wails3 CLI 自己的依赖图里带了 cgo 源文件：beta.28 的
+      # v3/internal/operatingsystem/webkit_linux.go 是
+      #   //go:build linux && cgo && !gtk3 && !android
+      #   #cgo linux pkg-config: gtk4 webkitgtk-6.0
+      # 而 cmd/wails3 经 internal/doctor、internal/setupwizard、internal/commands
+      # 都会链到这个包。ubuntu runner 默认 CGO_ENABLED=1，于是 `go install cmd/wails3`
+      # 需要系统里有 GTK4 + WebKitGTK 6.0 的开发头文件，缺了就在装完 Go/Node 之后
+      # 立刻报 "Package gtk4 was not found in the pkg-config search path"（run 102993449283）。
+      # 这一步只服务 CLI 的编译期，与 App 无关：Android App 用 NDK 交叉编译，
+      # GOOS=android 会排除上面这些 cgo 文件，所以下面 wails3-setup 的 gui-deps 仍保持
+      # false。头文件必须在这里先装：wails3-setup 内部是先 go install CLI、后装平台依赖，
+      # 顺序上它自己解决不了（而且它装的是 App 用的 GTK3/WebKit2GTK 4.1，不是 CLI 要的
+      # gtk4/webkitgtk-6.0）。
+      - name: Install GTK4 / WebKitGTK-6.0 headers (wails3 CLI build only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libwebkitgtk-6.0-dev
+          echo "pkg-config 探测："
+          pkg-config --modversion gtk4 webkitgtk-6.0
+
       # 只借它装 Go/Node/wails3、推导版本号、同步 build/config.yml；
       # Android 用 NDK clang 交叉编译，不需要 GTK/sqlite 头，也不需要
       # build/runtime（MinGit 与 onnxruntime 在 Android 上没有对应形态）。
