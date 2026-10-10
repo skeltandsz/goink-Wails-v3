@@ -37,7 +37,9 @@ type goGitBackend struct {
 	logger *slog.Logger
 }
 
-func (g *goGitBackend) log() *slog.Logger {
+// lg 返回后端 logger，缺省时回退 slog.Default()。
+// 刻意不叫 log：backend 接口的 log(relPath, n) 是 `git log`，方法名会撞车。
+func (g *goGitBackend) lg() *slog.Logger {
 	if g.logger == nil {
 		return slog.Default()
 	}
@@ -128,9 +130,9 @@ func (g *goGitBackend) signature(repo *gogit.Repository) *object.Signature {
 			email = cfg.User.Email
 		}
 	}
-	now := time.Now()
-	_, zoneOffset := now.Zone()
-	return &object.Signature{Name: name, Email: email, When: now, ZoneOffset: zoneOffset / 60}
+	// go-git v5 的 object.Signature 只有 Name/Email/When 三个字段（v6 才有
+	// ZoneOffset），时区偏移由 When 携带的 location 在编码 commit 时算出。
+	return &object.Signature{Name: name, Email: email, When: time.Now()}
 }
 
 // ── 写路径 ────────────────────────────────────────────────
@@ -167,7 +169,9 @@ func (g *goGitBackend) commitWith(repo *gogit.Repository, wt *gogit.Worktree, ms
 	// All:false：只提交索引里已有的内容，与 CLI 的 `git commit -m`（不含 -a）一致。
 	hash, err := wt.Commit(msg, &gogit.CommitOptions{Author: g.signature(repo)})
 	if err != nil {
-		if errors.Is(err, gogit.NoChangesError{}) {
+		// go-git v5 用哨兵错误 ErrEmptyCommit 表示"干净工作区，提交不了东西"
+		// （v6 才换成 NoChangesError 类型）。
+		if errors.Is(err, gogit.ErrEmptyCommit) {
 			// 对齐 CLI：git 在"无变更"时也是非零退出，上层按 commit 失败处理。
 			return "", fmt.Errorf("git: commit: nothing to commit")
 		}
@@ -192,8 +196,9 @@ func (g *goGitBackend) hasUncommitted() (bool, error) {
 	// go-git 的 Status 是"路径 -> 变更"的 map，含未跟踪文件，
 	// 与 `git status --porcelain` 非空判定一致。
 	for _, entry := range st {
-		if entry != nil && entry.Staging != plumbing.ZeroHash {
-			// Staging 字段只是索引侧 hash；任何非空状态都算未提交。
+		// go-git 的 Staging/Worktree 是 StatusCode（' '/'M'/'A'/'?' 这类字符），
+		// 不是 hash；Status map 只在有变化时才建条目，这里再排一次"两侧都未修改"。
+		if entry != nil && (entry.Staging != gogit.Unmodified || entry.Worktree != gogit.Unmodified) {
 			return true, nil
 		}
 	}
@@ -313,7 +318,8 @@ func (g *goGitBackend) revertAbort() error {
 	if err != nil {
 		return fmt.Errorf("git: revert --abort: %w", err)
 	}
-	if err := wt.Reset(&gogit.ResetOptions{Mode: gogit.HardReset, Commit: target.Hash()}); err != nil {
+	// object.Commit.Hash 是字段不是方法（v5 没有 Hash() getter）。
+	if err := wt.Reset(&gogit.ResetOptions{Mode: gogit.HardReset, Commit: target.Hash}); err != nil {
 		return fmt.Errorf("git: revert --abort: %w", err)
 	}
 	return nil
@@ -357,7 +363,7 @@ func (g *goGitBackend) logDetailed(n int, afterHash string) ([]CommitInfo, error
 		if err != nil {
 			continue
 		}
-		files, ins, del, err := g.commitStats(c)
+		files, ins, del, err := g.commitStats(repo, c)
 		if err != nil {
 			return nil, err
 		}
@@ -457,7 +463,9 @@ func firstLine(s string) string {
 }
 
 // commitStats 返回该提交的变更文件数与增删行数（等价 git log --numstat 的汇总）。
-func (g *goGitBackend) commitStats(c *object.Commit) (files, added, deleted int, err error) {
+// repo 由调用方传入：go-git v5 的 object.Commit 没有 Repository() 方法，
+// 拿不到 store 就没法解引用 blob。
+func (g *goGitBackend) commitStats(repo *gogit.Repository, c *object.Commit) (files, added, deleted int, err error) {
 	cur, err := treeEntries(c)
 	if err != nil {
 		return 0, 0, 0, err
@@ -472,7 +480,6 @@ func (g *goGitBackend) commitStats(c *object.Commit) (files, added, deleted int,
 			return 0, 0, 0, err
 		}
 	}
-	repo := c.Repository()
 	for path := range unionOfKeys(cur, old) {
 		newBlob, inNew := cur[path]
 		oldBlob, inOld := old[path]
@@ -503,7 +510,8 @@ func lineDelta(repo *gogit.Repository, from, to plumbing.Hash) (added, deleted i
 	if oldText == nil || newText == nil { // 任一侧是二进制
 		return 0, 0, nil
 	}
-	return countLineDiff(*oldText, *newText), 0, nil
+	a, d := countLineDiff(*oldText, *newText)
+	return a, d, nil
 }
 
 // commitFileList 返回 commit 元信息 + 变更文件列表。
@@ -517,11 +525,11 @@ func (g *goGitBackend) commitFileList(hash string) (*CommitInfo, []FileEntry, er
 		return nil, nil, err
 	}
 	info := commitInfo(c)
-	entries, err := g.changeEntries(&c)
+	entries, err := g.changeEntries(c)
 	if err != nil {
 		return nil, nil, err
 	}
-	files, ins, del, err := g.commitStats(c)
+	files, ins, del, err := g.commitStats(repo, c)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -630,7 +638,7 @@ func (g *goGitBackend) showFile(hash, filePath string) (*FileDiff, error) {
 	if err != nil {
 		return nil, err
 	}
-	entries, err := g.changeEntries(&c)
+	entries, err := g.changeEntries(c)
 	if err != nil {
 		return nil, err
 	}
@@ -659,7 +667,7 @@ func (g *goGitBackend) showFile(hash, filePath string) (*FileDiff, error) {
 		f, err := target.File(path)
 		if err != nil {
 			if isMissingInCommit(err) {
-				g.log().Debug("go-git: file not in commit", "path", path, "commit", target.Hash.String())
+				g.lg().Debug("go-git: file not in commit", "path", path, "commit", target.Hash.String())
 				return "", nil
 			}
 			return "", err
@@ -794,7 +802,8 @@ func isBinaryContent(b []byte) bool {
 	return bytes.IndexByte(b[:limit], 0) >= 0
 }
 
-func unionOfKeys[T any, U any](a map[T]U, b map[T]U) map[T]struct{} {
+// unionOfKeys 求两个 map 的键并集；T 必须是 comparable（map 的键类型）。
+func unionOfKeys[T comparable, U any](a map[T]U, b map[T]U) map[T]struct{} {
 	out := make(map[T]struct{}, len(a)+len(b))
 	for k := range a {
 		out[k] = struct{}{}

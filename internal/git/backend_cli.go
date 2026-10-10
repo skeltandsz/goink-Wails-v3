@@ -23,7 +23,9 @@ type cliBackend struct {
 	logger *slog.Logger
 }
 
-func (c *cliBackend) log() *slog.Logger {
+// lg 返回后端 logger，缺省时回退 slog.Default()。
+// 刻意不叫 log：backend 接口的 log(relPath, n) 是 `git log`，方法名会撞车。
+func (c *cliBackend) lg() *slog.Logger {
 	if c.logger == nil {
 		return slog.Default()
 	}
@@ -378,7 +380,7 @@ func (c *cliBackend) showFileContent(ref string) (string, error) {
 	content, _, err := c.runInDir("show", ref)
 	if err != nil {
 		if isNotExistInGit(err) {
-			c.log().Debug("git show: file not in commit", "ref", ref)
+			c.lg().Debug("git show: file not in commit", "ref", ref)
 			return "", nil
 		}
 		return "", err
